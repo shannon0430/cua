@@ -233,8 +233,34 @@ jobs:
           )
           $scope = Get-Content -Raw (Join-Path $out 'source-and-scope.json') | ConvertFrom-Json
           foreach ($group in $scope.requiredUnitGroups) { Invoke-SelectedTests $group }
-          $prior = @($results | Where-Object { $_.label -in @('wheel-target-admission', 'set-value-native-readback') } | Measure-Object -Property passed -Sum)
-          if ($prior[0].Sum -ne 13) { throw 'Prior frozen helper count changed' }
+          # BEGIN EXACT PRIOR HELPER AGGREGATION FUNCTION
+          function Assert-PriorHelperAggregation([System.Collections.Generic.List[object]]$Records) {
+            $expected = [ordered]@{ 'wheel-target-admission'=9; 'set-value-native-readback'=4 }
+            $seen = @{}
+            $selected = [System.Collections.Generic.List[object]]::new()
+            $passed = 0
+            foreach ($record in $Records) {
+              if ($record -isnot [System.Collections.IDictionary]) { throw 'Native result is not a dictionary' }
+              $label = [string]$record['label']
+              if (-not $expected.Contains($label)) { continue }
+              if ($seen.ContainsKey($label)) { throw "Duplicate prior helper group: $label" }
+              $required = [int]$expected[$label]
+              foreach ($key in @('expected', 'listed', 'passed')) {
+                if (-not $record.Contains($key) -or [int]$record[$key] -ne $required) { throw "Prior helper count mismatch: $label/$key" }
+              }
+              foreach ($key in @('failed', 'ignored')) {
+                if (-not $record.Contains($key) -or [int]$record[$key] -ne 0) { throw "Prior helper non-passing result: $label/$key" }
+              }
+              $seen[$label] = $true
+              $passed += [int]$record['passed']
+              $selected.Add([ordered]@{ label=$label; passed=[int]$record['passed']; expected=$required })
+            }
+            if ($seen.Count -ne 2 -or $passed -ne 13) { throw "Prior frozen helper groups/count changed: groups=$($seen.Count), passed=$passed" }
+            return [pscustomobject]@{ expectedGroups=2; observedGroups=$seen.Count; expectedPassed=13; observedPassed=$passed; groups=$selected.ToArray(); method='explicit IDictionary key access, unique labels, exact per-label counts' }
+          }
+          # END EXACT PRIOR HELPER AGGREGATION FUNCTION
+          $prior = Assert-PriorHelperAggregation -Records $results
+          $prior | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'prior-helper-aggregation.json')
 
       - name: Run both explicitly ignored owned native fixtures with separate scopes
         working-directory: libs/cua-driver/rust
