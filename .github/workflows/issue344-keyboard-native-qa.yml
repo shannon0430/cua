@@ -61,6 +61,7 @@ jobs:
           if ($manifest.nativeQa.expectedPriorHelperTests -ne 13) { throw 'Exactly 13 prior helpers required' }
           if ($manifest.nativeQa.nodeVersion -ne '24.19.0') { throw 'Exact live Node version required' }
           if ($manifest.nativeQa.rustToolchain -ne '1.97.1' -or $manifest.nativeQa.target -ne 'x86_64-pc-windows-msvc' -or $manifest.nativeQa.sdkVersion -ne '0.28.2') { throw 'Exact locked native toolchain/SDK scope required' }
+          if ($manifest.compatibilityBaseCommit -ne '891efae2cc01a38260a303b0329785e5c4d7b03c' -or $manifest.compatibilityPatchSha256 -ne '4222d5fdaea826127cbfa9027725b72f1f54d3bbc28e665e9baf6241d9aa2655' -or $manifest.compatibilityAuthorManifestSha256 -ne '88b2601f6d6a256b6f7040baf27c8ac26c8aa7e6ca5a87ca48eeee08e48a64e9' -or $manifest.compatibilityReviewStatus -ne 'independent_source_review_pass_windows_pending' -or $manifest.compatibilityIndependentReviewSha256 -ne 'c4253dcaf96a887418e14c081081a3adc7d381f5e455c96f954087164da150a9' -or $manifest.nativeQa.expectedCompatibilityTests -ne 27) { throw 'Exact independently reviewed compatibility freeze required' }
           $requiredGroups = @{
             'wheel-target-admission' = @('platform-windows', 'input::mouse::wheel_target_admission_tests::')
             'set-value-native-readback' = @('platform-windows', 'tools::impl_::set_value_native_readback_tests::')
@@ -70,6 +71,9 @@ jobs:
             'windows-delivery-guidance' = @('platform-windows', 'input::delivery::tests::')
             'core-desktop-independent' = @('cua-driver-core', '')
             'sdk-abi' = @('cua-driver-sdk', 'abi::tests::')
+            'virtual-scope-ownership' = @('platform-windows', 'uia::cache::input_scope_ownership_tests::')
+            'virtual-wheel-final-scope' = @('platform-windows', 'input::mouse::virtual_wheel_ownership_tests::')
+            'virtual-key-final-scope' = @('platform-windows', 'input::keyboard::virtual_key_scope_tests::')
           }
           if (@($manifest.nativeQa.unitGroups).Count -ne $requiredGroups.Count) { throw 'Every required unit group must be explicit' }
           foreach ($label in $requiredGroups.Keys) {
@@ -98,7 +102,9 @@ jobs:
             'libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs',
             'libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs'
           )
-          $allowed = $sourcePaths + @($manifestPath, '.github/workflows/issue344-keyboard-native-qa.yml')
+          $documentationPath = 'libs/cua-driver/docs/foreground-target-ownership.md'
+          if (@($manifest.documentation).Count -ne 1 -or $manifest.documentation[0].path -ne $documentationPath -or $manifest.documentation[0].sha256 -ne '53d4da7cd98a168ade9cd0cbbc7acaffb1b348182dd77f1892c2cc4939cfe90c' -or (Get-FileHash -Algorithm SHA256 $documentationPath).Hash.ToLowerInvariant() -ne $manifest.documentation[0].sha256) { throw 'Exact ownership contract document required' }
+          $allowed = $sourcePaths + @($documentationPath, $manifestPath, '.github/workflows/issue344-keyboard-native-qa.yml')
           $changed = @(& git diff --name-only $base HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source changes' }
           foreach ($path in $changed) {
@@ -129,6 +135,11 @@ jobs:
             keyboardWitnessPatchSha256 = $manifest.keyboardWitnessPatchSha256
             authorManifestSha256 = $manifest.authorManifestSha256
             finalSourceFiles = $manifest.files
+            compatibilityBaseCommit = $manifest.compatibilityBaseCommit
+            compatibilityPatchSha256 = $manifest.compatibilityPatchSha256
+            compatibilityAuthorManifestSha256 = $manifest.compatibilityAuthorManifestSha256
+            compatibilityIndependentReviewSha256 = $manifest.compatibilityIndependentReviewSha256
+            documentation = $manifest.documentation
             changedFiles = $changed
             expectedPriorHelperTests = 13
             requiredUnitGroups = $manifest.nativeQa.unitGroups

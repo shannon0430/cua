@@ -8,13 +8,15 @@
       "path": "libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs",
       "originalSha256": "c1c038f202f664a5af133bcce12215f6d704e5b0029f45c6376bbd8420601129",
       "priorCandidateSha256": "5cba8e206d55ba69b331f044694deee3e2c3d6985fbd82787a3d44112c15b9ca",
-      "candidateSha256": "59e36132b51d8c7949afcf92f3f9e74b4ac25f71bd868c9f8b206a9653a381c5"
+      "candidateSha256": "84211e4398ba641f019f931efc28a6e2cc968054c588682174ef00bd08b97729",
+      "preCompatibilitySha256": "59e36132b51d8c7949afcf92f3f9e74b4ac25f71bd868c9f8b206a9653a381c5"
     },
     {
       "path": "libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs",
       "originalSha256": "ef92cbb8c8989092dfcd163d50ed74dc239d8ae9cdb45a2ffa98d49559f2841a",
       "priorCandidateSha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09",
-      "candidateSha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09"
+      "candidateSha256": "8050cefdf1e85ce484fa9e8cd4320c9cc652b49fe3bca38189b244f45ad3a6bf",
+      "preCompatibilitySha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09"
     },
     {
       "path": "libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs",
@@ -26,7 +28,8 @@
       "path": "libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs",
       "originalSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
       "priorCandidateSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
-      "candidateSha256": "4d38b2e8f57174766f14af53c9979acf5da14ac972f57b79dff00ca346b49874"
+      "candidateSha256": "f73d5e3fd816b26d637e1970c662f3375a8d399a210e159735e3ffb898613d44",
+      "preCompatibilitySha256": "4d38b2e8f57174766f14af53c9979acf5da14ac972f57b79dff00ca346b49874"
     }
   ],
   "nativeQa": {
@@ -83,6 +86,24 @@
         "package": "cua-driver-sdk",
         "filter": "abi::tests::",
         "expected": 6
+      },
+      {
+        "label": "virtual-scope-ownership",
+        "package": "platform-windows",
+        "filter": "uia::cache::input_scope_ownership_tests::",
+        "expected": 13
+      },
+      {
+        "label": "virtual-wheel-final-scope",
+        "package": "platform-windows",
+        "filter": "input::mouse::virtual_wheel_ownership_tests::",
+        "expected": 6
+      },
+      {
+        "label": "virtual-key-final-scope",
+        "package": "platform-windows",
+        "filter": "input::keyboard::virtual_key_scope_tests::",
+        "expected": 8
       }
     ],
     "interactiveExcelAcceptance": "not_performed_by_this_workflow",
@@ -108,12 +129,25 @@
     ],
     "expectedNewWitnessTests": 12,
     "expectedOwnedFixtures": 2,
-    "ownedKeyMetadataAssertion": "same production result owner; marker18 fields/actual delivered_count/effect/route/delivery projection consistency for each actual owned key; numeric SDK2/2/1 mapping source reviewed, not SDK OS transport runtime"
+    "ownedKeyMetadataAssertion": "same production result owner; marker18 fields/actual delivered_count/effect/route/delivery projection consistency for each actual owned key; numeric SDK2/2/1 mapping source reviewed, not SDK OS transport runtime",
+    "expectedCompatibilityTests": 27
   },
   "authorManifestSha256": "fca92fc17632e8a2465f3008b8cc8f6d776f3ddcbcd4cbde6ca46beab0edc27d",
-  "sourceReviewBoundary": "fixture-v3 author freeze and independent exact four cfg(test) HWND corrections review PASS; native compile/668+2 fixtures/Node24 import pending",
-  "cumulativePatchRule": "public base + immutable02a81 + fixture-v3 dd7e cumulative only; do not stack996046/ab5 or separate COM patch; existing1173 source correction uses exact v2-to-v3 incremental patch only",
+  "sourceReviewBoundary": "Independent exact source review PASS; actual Windows MSVC 695 unit +2 owned fixture acceptance pending. No changed canonical expectations.",
+  "cumulativePatchRule": "Current exact891ef + frozen compatibility4222d5 incremental. Preserve original base/prior keyboard patch bindings; no separate COM patch.",
   "fixtureOnlyPredecessorQaManifestSha256": "28f3e4f8b106eb0f23563df7ade3fe2f3b3ab18b79b5ebc481e3a592e63f59a6",
   "fixtureOnlyIncrementalPatchSha256": "3f127014a13c3102e3ffe102dadb9f72bea41a0631e463d752ed629cc5519003",
-  "independentFixtureReviewSha256": "6ccda62f4aa37a29ea7462e2db1510096faab7cd56a1b84395802b3bbfeea7a2"
+  "independentFixtureReviewSha256": "6ccda62f4aa37a29ea7462e2db1510096faab7cd56a1b84395802b3bbfeea7a2",
+  "compatibilityBaseCommit": "891efae2cc01a38260a303b0329785e5c4d7b03c",
+  "compatibilityPatchSha256": "4222d5fdaea826127cbfa9027725b72f1f54d3bbc28e665e9baf6241d9aa2655",
+  "compatibilityAuthorManifestSha256": "88b2601f6d6a256b6f7040baf27c8ac26c8aa7e6ca5a87ca48eeee08e48a64e9",
+  "compatibilityReviewStatus": "independent_source_review_pass_windows_pending",
+  "documentation": [
+    {
+      "path": "libs/cua-driver/docs/foreground-target-ownership.md",
+      "sha256": "53d4da7cd98a168ade9cd0cbbc7acaffb1b348182dd77f1892c2cc4939cfe90c"
+    }
+  ],
+  "compatibilityPredecessorManifestSha256": "4589c8b04de75bc8db43b1f3be23b087fd51954509f96f1a56db37c37ee58b4e",
+  "compatibilityIndependentReviewSha256": "c4253dcaf96a887418e14c081081a3adc7d381f5e455c96f954087164da150a9"
 }

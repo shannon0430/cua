@@ -1039,7 +1039,8 @@ pub(crate) fn send_wheel_synthesized_to_window(
 }
 
 /// Admit a wheel only when native hover and focus belong to the exact root,
-/// and UIA identifies focus inside the nearest hovered scroll container.
+/// and UIA identifies precise control focus, or a proved virtual document
+/// fragment with exact native-child ownership. Hover alone is insufficient.
 /// A same-process owner/sibling window is deliberately insufficient here.
 /// All UIA reads are observational; unavailable/ambiguous providers fail closed.
 fn confirm_wheel_target(
@@ -1061,7 +1062,7 @@ fn confirm_wheel_target(
 
     // Scope every COM owner so Release/CoUninitialize (which can RPC/pump
     // messages) finish BEFORE the final native-only witness.
-    {
+    let virtual_anchor = {
         // Balance only a successful COM initialisation. An existing apartment with
         // another concurrency model may still create the UIA object; never uninit it.
         struct ComInit(bool);
@@ -1080,9 +1081,6 @@ fn confirm_wheel_target(
             .context("wheel_focus_unverifiable: exact UIA target unavailable; no input was sent")?;
         let focused = unsafe { uia.GetFocusedElement() }
             .context("wheel_focus_unverifiable: focused element unavailable; no input was sent")?;
-        if unsafe { focused.CurrentProcessId() }? as u32 != expected_pid {
-            bail!("wheel_focus_mismatch: focused UIA element belongs to another process; no input was sent");
-        }
         let walker = unsafe { uia.RawViewWalker() }?;
         let same = |left: &IUIAutomationElement, right: &IUIAutomationElement| -> Result<bool> {
             Ok(unsafe { uia.CompareElements(left, right) }?.as_bool())
@@ -1111,9 +1109,53 @@ fn confirm_wheel_target(
                 "wheel_focus_unverifiable: no precise hovered scroll container; no input was sent"
             )
         })?;
-        if !wheel_focus_is_descendant(&focused, &scope, &boundary, same, parent)? {
-            bail!("wheel_focus_mismatch: focus is outside hovered scroll container; no input was sent; focus the intended container with a separate standard action and take a fresh observation");
-        }
+        // Virtual hover semantics are admitted only with a proved windowless
+        // Document/native-child fragment. A native list/SDM control still needs
+        // exact focus inside its hovered scope; no auto click/focus is added.
+        let virtual_scope = match crate::uia::cache::read_input_uia_scope(
+            &uia,
+            &scope,
+            &boundary,
+            target.0 as usize as u64,
+            expected_pid,
+            false,
+        ) {
+            Ok(scope) => Some(scope),
+            Err(crate::uia::cache::KeyboardUiaWitnessError::ProcessMismatch) => None,
+            Err(error) => return Err(wheel_scope_query_error(error)),
+        };
+        let hover_provider_pid = if virtual_scope.is_some() {
+            Some(crate::uia::cache::read_input_uia_pid(&hovered).map_err(wheel_scope_query_error)?)
+        } else {
+            None
+        };
+        let virtual_focus = if let Some(scope) = &virtual_scope {
+            let focus = crate::uia::cache::read_input_uia_scope(
+                &uia,
+                &focused,
+                &boundary,
+                target.0 as usize as u64,
+                expected_pid,
+                false,
+            )
+            .map_err(wheel_scope_query_error)?;
+            if hover_provider_pid != Some(focus.primitive.provider_pid)
+                || !scope
+                    .same_virtual_document(&focus, &uia)
+                    .map_err(wheel_scope_query_error)?
+            {
+                bail!("wheel_focus_mismatch: virtual focus is outside the exact hovered document fragment; no input was sent");
+            }
+            Some(focus)
+        } else {
+            if crate::uia::cache::read_input_uia_pid(&focused).map_err(wheel_scope_query_error)?
+                != expected_pid
+                || !wheel_focus_is_descendant(&focused, &scope, &boundary, same, parent)?
+            {
+                bail!("wheel_focus_mismatch: focus is outside hovered native scroll container; no input was sent; focus the intended container with a separate standard action and take a fresh observation");
+            }
+            None
+        };
 
         // Refresh all provider-derived identities/ancestry first. An unchanged
         // HWND can still host a different virtual sibling control or scroll scope.
@@ -1127,32 +1169,159 @@ fn confirm_wheel_target(
         {
             bail!("wheel_target_unavailable: UIA target/hover/focus identity changed during admission; no input was sent");
         }
-        let now_scope = nearest_wheel_scope(now_hovered, &now_boundary, same, parent, |current| {
-            let kind = unsafe { current.CurrentControlType() }?;
-            Ok(kind == UIA_ListControlTypeId
-                || kind == UIA_TreeControlTypeId
-                || kind == UIA_TableControlTypeId
-                || kind == UIA_DataGridControlTypeId
-                || unsafe { current.GetCurrentPattern(UIA_ScrollPatternId) }.is_ok())
-        })?
+        let now_scope = nearest_wheel_scope(
+            now_hovered.clone(),
+            &now_boundary,
+            same,
+            parent,
+            |current| {
+                let kind = unsafe { current.CurrentControlType() }?;
+                Ok(kind == UIA_ListControlTypeId
+                    || kind == UIA_TreeControlTypeId
+                    || kind == UIA_TableControlTypeId
+                    || kind == UIA_DataGridControlTypeId
+                    || unsafe { current.GetCurrentPattern(UIA_ScrollPatternId) }.is_ok())
+            },
+        )?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "wheel_focus_unverifiable: hovered scroll scope disappeared; no input was sent"
             )
         })?;
-        if !same(&scope, &now_scope)?
-            || !wheel_focus_is_descendant(&now_focused, &now_scope, &now_boundary, same, parent)?
-        {
-            bail!("wheel_focus_mismatch: hovered scroll scope or focused-element membership changed; no input was sent");
+        if !same(&scope, &now_scope)? {
+            bail!("wheel_focus_mismatch: hovered scroll scope changed; no input was sent");
         }
-    }
+        if let (Some(previous_scope), Some(previous_focus)) = (&virtual_scope, &virtual_focus) {
+            let refreshed_scope = crate::uia::cache::read_input_uia_scope(
+                &uia,
+                &now_scope,
+                &now_boundary,
+                target.0 as usize as u64,
+                expected_pid,
+                false,
+            )
+            .map_err(wheel_scope_query_error)?;
+            let refreshed_focus = crate::uia::cache::read_input_uia_scope(
+                &uia,
+                &now_focused,
+                &now_boundary,
+                target.0 as usize as u64,
+                expected_pid,
+                false,
+            )
+            .map_err(wheel_scope_query_error)?;
+            if !previous_scope
+                .same_identity(&refreshed_scope, &uia)
+                .map_err(wheel_scope_query_error)?
+                || !previous_focus
+                    .same_identity(&refreshed_focus, &uia)
+                    .map_err(wheel_scope_query_error)?
+                || !refreshed_scope
+                    .same_virtual_document(&refreshed_focus, &uia)
+                    .map_err(wheel_scope_query_error)?
+            {
+                bail!("wheel_target_unavailable: virtual document/native-anchor ownership changed; no input was sent");
+            }
+            // Recheck exact focus/hover identities after every ancestry/provider
+            // callback; every COM owner is then dropped before native admission.
+            let last_hover = unsafe { uia.ElementFromPoint(POINT { x: sx, y: sy }) }?;
+            let last_focus = unsafe { uia.GetFocusedElement() }?;
+            if !same(&now_hovered, &last_hover)?
+                || !same(&now_focused, &last_focus)?
+                || Some(
+                    crate::uia::cache::read_input_uia_pid(&last_hover)
+                        .map_err(wheel_scope_query_error)?,
+                ) != hover_provider_pid
+                || crate::uia::cache::read_input_uia_pid(&last_focus)
+                    .map_err(wheel_scope_query_error)?
+                    != refreshed_focus.primitive.provider_pid
+            {
+                bail!("wheel_target_unavailable: virtual hover/focus changed during admission; no input was sent");
+            }
+            Some(refreshed_scope.primitive)
+        } else {
+            if crate::uia::cache::read_input_uia_pid(&now_focused)
+                .map_err(wheel_scope_query_error)?
+                != expected_pid
+                || !wheel_focus_is_descendant(
+                    &now_focused,
+                    &now_scope,
+                    &now_boundary,
+                    same,
+                    parent,
+                )?
+            {
+                bail!("wheel_focus_mismatch: hovered native scope or focus membership changed; no input was sent");
+            }
+            None
+        }
+    };
+
     // All UIA reads, interface Release and CoUninitialize have completed.
     // No COM owner/drop/provider read lies between this witness and SendInput.
     let final_native = read_wheel_native_witness(target, root, expected_pid, sx, sy)?;
     if !wheel_native_witness_unchanged(&before_native, &final_native) {
         bail!("wheel_target_unavailable: native target/root/hover/focus changed after provider reads; no input was sent");
     }
+    if let Some(anchor) = virtual_anchor {
+        // Bind membership to the latest native sample, not before_native. A
+        // reparented intermediate ancestor may leave leaf HWND/root unchanged.
+        // Two native-only passes refresh physical anchor and containment; no
+        // COM/provider work or destructor remains between them and dispatch.
+        confirm_virtual_wheel_native_relation(anchor, target, &final_native)?;
+        let latest = read_wheel_native_witness(target, root, expected_pid, sx, sy)?;
+        if !wheel_native_witness_unchanged(&final_native, &latest) {
+            bail!("wheel_target_unavailable: virtual native identities changed during final admission; no input was sent");
+        }
+        confirm_virtual_wheel_native_relation(anchor, target, &latest)?;
+    }
     Ok(())
+}
+
+fn virtual_wheel_relation_admitted(
+    expected: crate::uia::cache::InputUiaScopeWitness,
+    actual: crate::uia::cache::InputUiaScopeWitness,
+    hover_within_anchor: bool,
+    focus_within_anchor: bool,
+) -> bool {
+    expected == actual
+        && expected.ownership == crate::uia::cache::InputUiaOwnership::VirtualDocument
+        && expected.own_native_hwnd == 0
+        && expected.nearest_native_hwnd != expected.anchor_root
+        && hover_within_anchor
+        && focus_within_anchor
+}
+fn confirm_virtual_wheel_native_relation(
+    anchor: crate::uia::cache::InputUiaScopeWitness,
+    target: HWND,
+    latest: &WheelNativeWitness,
+) -> Result<()> {
+    let refreshed = crate::uia::cache::read_input_native_scope(anchor, target.0 as usize as u64)
+        .map_err(wheel_scope_query_error)?;
+    let child = HWND(anchor.nearest_native_hwnd as *mut _);
+    let belongs = |h: u64| {
+        h == anchor.nearest_native_hwnd
+            || unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(child, HWND(h as *mut _)) }
+                .as_bool()
+    };
+    if !virtual_wheel_relation_admitted(
+        anchor,
+        refreshed,
+        belongs(latest.hover),
+        belongs(latest.focus),
+    ) {
+        bail!("wheel_focus_mismatch: latest native hover/focus or ownership is outside proved virtual anchor; no input was sent");
+    }
+    Ok(())
+}
+
+fn wheel_scope_query_error(error: crate::uia::cache::KeyboardUiaWitnessError) -> anyhow::Error {
+    use crate::uia::cache::KeyboardUiaWitnessError as Failure;
+    match error {
+        Failure::Unavailable(Some(hr)) => anyhow::anyhow!(
+            "wheel_target_unavailable: virtual ownership query failed (HRESULT 0x{:08X}); no input was sent", hr as u32),
+        _ => anyhow::anyhow!("wheel_target_unavailable: precise native or virtual target ownership could not be proved; no input was sent"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1728,5 +1897,86 @@ mod wheel_tests {
     #[test]
     fn wheel_data_zero_is_zero() {
         assert_eq!(wheel_mouse_data(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod virtual_wheel_ownership_tests {
+    use super::*;
+    use crate::uia::cache::{InputUiaOwnership, InputUiaScopeWitness};
+    fn anchor() -> InputUiaScopeWitness {
+        InputUiaScopeWitness {
+            own_native_hwnd: 0,
+            nearest_native_hwnd: 12,
+            provider_pid: 77,
+            anchor_pid: 33,
+            anchor_thread: 22,
+            anchor_parent: 10,
+            anchor_root: 10,
+            ownership: InputUiaOwnership::VirtualDocument,
+        }
+    }
+    #[test]
+    fn proved_virtual_document_allows_hover_scope_without_keyboard_focus_in_scroll_control() {
+        assert!(virtual_wheel_relation_admitted(
+            anchor(),
+            anchor(),
+            true,
+            true
+        ));
+    }
+    #[test]
+    fn same_leaf_hwnd_and_root_but_intermediate_focus_ancestor_reparent_refuses() {
+        assert!(!virtual_wheel_relation_admitted(
+            anchor(),
+            anchor(),
+            true,
+            false
+        ));
+    }
+    #[test]
+    fn same_leaf_hwnd_and_root_but_hover_ancestor_reparent_refuses() {
+        assert!(!virtual_wheel_relation_admitted(
+            anchor(),
+            anchor(),
+            false,
+            true
+        ));
+    }
+    #[test]
+    fn native_anchor_parent_drift_refuses() {
+        let mut actual = anchor();
+        actual.anchor_parent = 99;
+        assert!(!virtual_wheel_relation_admitted(
+            anchor(),
+            actual,
+            true,
+            true
+        ));
+    }
+    #[test]
+    fn wrong_root_or_reused_native_anchor_owner_refuses() {
+        let mut actual = anchor();
+        actual.anchor_root = 20;
+        assert!(!virtual_wheel_relation_admitted(
+            anchor(),
+            actual,
+            true,
+            true
+        ));
+        actual = anchor();
+        actual.anchor_pid = 44;
+        assert!(!virtual_wheel_relation_admitted(
+            anchor(),
+            actual,
+            true,
+            true
+        ));
+    }
+    #[test]
+    fn native_sdm_proof_cannot_enter_virtual_hover_relaxation() {
+        let mut direct = anchor();
+        direct.ownership = InputUiaOwnership::DirectProcess;
+        assert!(!virtual_wheel_relation_admitted(direct, direct, true, true));
     }
 }

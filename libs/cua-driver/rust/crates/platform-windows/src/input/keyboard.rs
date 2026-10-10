@@ -495,7 +495,7 @@ pub(crate) enum KeyboardElementReferenceKind {
     Token,
     IndexSnapshot,
 }
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum KeyboardNativeCorrelation {
     ExactNativeChild,
@@ -532,6 +532,9 @@ pub(crate) struct KeyboardFocusWitness {
     pub element_reference_kind: KeyboardElementReferenceKind,
     pub uia_has_keyboard_focus: Option<bool>,
     pub uia_focused_element_equals_target: Option<bool>,
+    /// True only for proved target-boundary process ownership: direct PID
+    /// equality, or the exact windowless Document/native-child proof path.
+    /// It does not assert leaf PID numerically equals frame PID on virtual input.
     pub uia_process_matches_target: Option<bool>,
     pub native_foreground_relation: KeyboardForegroundRelation,
     pub native_foreground_stable: Option<bool>,
@@ -584,21 +587,91 @@ impl KeyboardFocusWitness {
     ) -> KeyboardWitnessFailure {
         self.failure_code = Some(code);
         self.provider_failure_code = hresult;
-        KeyboardWitnessFailure { witness: self }
+        KeyboardWitnessFailure {
+            witness: self,
+            native_rejection: None,
+        }
     }
 }
+/// Private, content-free native subreason. It stays in the refusal prefix, not
+/// the closed 18-field payload; no target IDs, titles, values or PID are logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardNativeRejection {
+    Unclassified,
+    AdmittedTarget,
+    Foreground,
+    ForegroundThread,
+    GuiThreadQuery,
+    ActiveBoundary,
+    FocusBoundary,
+    FocusThread,
+    ForegroundChanged,
+    AnchorUnavailable,
+    AnchorIdentity,
+    AnchorFocusRelation,
+    NativeSnapshotChanged,
+}
+impl KeyboardNativeRejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::AdmittedTarget => "admitted_target",
+            Self::Foreground => "foreground",
+            Self::ForegroundThread => "foreground_thread",
+            Self::GuiThreadQuery => "gui_thread_query",
+            Self::ActiveBoundary => "active_boundary",
+            Self::FocusBoundary => "focus_boundary",
+            Self::FocusThread => "focus_thread",
+            Self::ForegroundChanged => "foreground_changed",
+            Self::AnchorUnavailable => "anchor_unavailable",
+            Self::AnchorIdentity => "anchor_identity",
+            Self::AnchorFocusRelation => "anchor_focus_relation",
+            Self::NativeSnapshotChanged => "native_snapshot_changed",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct KeyboardNativeReadFailure {
+    code: KeyboardWitnessFailureCode,
+    reason: KeyboardNativeRejection,
+}
+impl From<KeyboardWitnessFailureCode> for KeyboardNativeReadFailure {
+    fn from(code: KeyboardWitnessFailureCode) -> Self {
+        Self {
+            code,
+            reason: KeyboardNativeRejection::Unclassified,
+        }
+    }
+}
+impl KeyboardWitnessFailureCode {
+    fn at(self, reason: KeyboardNativeRejection) -> KeyboardNativeReadFailure {
+        KeyboardNativeReadFailure { code: self, reason }
+    }
+}
+impl KeyboardFocusWitness {
+    fn fail_native(self, error: KeyboardNativeReadFailure) -> KeyboardWitnessFailure {
+        let mut failure = self.fail(error.code, None);
+        failure.native_rejection = Some(error.reason);
+        failure
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct KeyboardWitnessFailure {
     pub witness: KeyboardFocusWitness,
+    native_rejection: Option<KeyboardNativeRejection>,
 }
 impl std::fmt::Display for KeyboardWitnessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // No HWND/PID, key text, provider text or native error message is exposed.
         write!(
             f,
-            "keyboard_focus_unavailable: retained-element key delivery did not complete;\n{}",
-            self.witness.diagnostic_text()
-        )
+            "keyboard_focus_unavailable: retained-element key delivery did not complete;"
+        )?;
+        if let Some(reason) = self.native_rejection {
+            write!(f, " native_subreason={};", reason.as_str())?;
+        }
+        write!(f, "\n{}", self.witness.diagnostic_text())
     }
 }
 impl std::error::Error for KeyboardWitnessFailure {}
@@ -620,28 +693,28 @@ struct KeyboardNativeWitness {
 fn read_keyboard_native_witness(
     hwnd: u64,
     expected_pid: u32,
-) -> Result<KeyboardNativeWitness, KeyboardWitnessFailureCode> {
+) -> Result<KeyboardNativeWitness, KeyboardNativeReadFailure> {
     use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsWindow, GA_ROOT};
     use KeyboardWitnessFailureCode as Failure;
     let target = HWND(hwnd as *mut _);
     if !unsafe { IsWindow(target) }.as_bool() {
-        return Err(Failure::TargetUnavailable);
+        return Err(Failure::TargetUnavailable.at(KeyboardNativeRejection::AdmittedTarget));
     }
     let mut target_pid = 0;
     let target_thread = unsafe { GetWindowThreadProcessId(target, Some(&mut target_pid)) };
     let root = unsafe { GetAncestor(target, GA_ROOT) };
     if target_thread == 0 || target_pid != expected_pid || root != target {
-        return Err(Failure::TargetUnavailable);
+        return Err(Failure::TargetUnavailable.at(KeyboardNativeRejection::AdmittedTarget));
     }
     let foreground = unsafe { GetForegroundWindow() };
     if foreground != target {
-        return Err(Failure::NativeFocusMismatch);
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::Foreground));
     }
     let mut foreground_pid = 0;
     let foreground_thread =
         unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
     if foreground_thread == 0 || foreground_pid != expected_pid {
-        return Err(Failure::NativeFocusMismatch);
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::ForegroundThread));
     }
     // Query the actual foreground thread, not a target child thread that may
     // retain inactive focus. Check the resulting primitive identity again.
@@ -650,23 +723,26 @@ fn read_keyboard_native_witness(
         ..Default::default()
     };
     unsafe { GetGUIThreadInfo(foreground_thread, &mut info) }
-        .map_err(|_| Failure::NativeFocusUnavailable)?;
+        .map_err(|_| Failure::NativeFocusUnavailable.at(KeyboardNativeRejection::GuiThreadQuery))?;
     let within = |window: HWND| {
         !window.0.is_null()
             && unsafe { IsWindow(window) }.as_bool()
             && (window == target || unsafe { IsChild(target, window) }.as_bool())
             && unsafe { GetAncestor(window, GA_ROOT) } == target
     };
-    if !within(info.hwndActive) || !within(info.hwndFocus) {
-        return Err(Failure::NativeFocusMismatch);
+    if !within(info.hwndActive) {
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::ActiveBoundary));
+    }
+    if !within(info.hwndFocus) {
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::FocusBoundary));
     }
     let mut focus_pid = 0;
     let focus_thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, Some(&mut focus_pid)) };
-    if focus_thread == 0
-        || focus_pid != expected_pid
-        || unsafe { GetForegroundWindow() } != foreground
-    {
-        return Err(Failure::NativeFocusMismatch);
+    if focus_thread == 0 || focus_pid == 0 {
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::FocusThread));
+    }
+    if unsafe { GetForegroundWindow() } != foreground {
+        return Err(Failure::NativeFocusMismatch.at(KeyboardNativeRejection::ForegroundChanged));
     }
     // Recheck the admitted HWND after all GUI reads, without provider work.
     let mut final_pid = 0;
@@ -674,7 +750,7 @@ fn read_keyboard_native_witness(
         || final_pid != expected_pid
         || unsafe { GetAncestor(target, GA_ROOT) } != root
     {
-        return Err(Failure::TargetUnavailable);
+        return Err(Failure::TargetUnavailable.at(KeyboardNativeRejection::AdmittedTarget));
     }
     Ok(KeyboardNativeWitness {
         target: hwnd,
@@ -698,10 +774,39 @@ struct KeyboardNativeScopeWitness {
     pid: u32,
 }
 
+fn keyboard_native_scope_matches(
+    native: KeyboardNativeWitness,
+    uia: crate::uia::cache::KeyboardUiaFocusWitness,
+    expected: crate::uia::cache::InputUiaScopeWitness,
+    refreshed: crate::uia::cache::InputUiaScopeWitness,
+    actual: KeyboardNativeScopeWitness,
+) -> bool {
+    use crate::uia::cache::InputUiaOwnership;
+    let direct = expected.ownership == InputUiaOwnership::DirectProcess;
+    native.target != 0
+        && native.target == native.root
+        && native.foreground == native.target
+        && native.target_pid != 0
+        && actual.thread != 0
+        && actual.root == native.root
+        && expected == refreshed
+        && expected.nearest_native_hwnd == uia.nearest_native_hwnd
+        && expected.own_native_hwnd == uia.own_native_hwnd
+        && actual.hwnd == expected.nearest_native_hwnd
+        && actual.pid == expected.anchor_pid
+        && actual.thread == expected.anchor_thread
+        && actual.parent == expected.anchor_parent
+        && if direct {
+            actual.pid == native.target_pid && native.focus_pid == native.target_pid
+        } else {
+            uia.own_native_hwnd == 0 && uia.nearest_native_hwnd != native.target
+        }
+}
+
 fn native_keyboard_correlation(
     native: KeyboardNativeWitness,
     uia: crate::uia::cache::KeyboardUiaFocusWitness,
-) -> Result<(KeyboardNativeCorrelation, KeyboardNativeScopeWitness), KeyboardWitnessFailureCode> {
+) -> Result<(KeyboardNativeCorrelation, KeyboardNativeScopeWitness), KeyboardNativeReadFailure> {
     use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsWindow, GA_ROOT};
     let nearest = HWND(uia.nearest_native_hwnd as *mut _);
     let focus = HWND(native.focus as *mut _);
@@ -713,16 +818,37 @@ fn native_keyboard_correlation(
         // Top-level windows may legitimately have no parent. An unreadable
         // descendant parent cannot establish stable native scope membership.
         Err(_) if uia.nearest_native_hwnd == native.target => 0,
-        Err(_) => return Err(KeyboardWitnessFailureCode::NativeFocusUnavailable),
+        Err(_) => {
+            return Err(KeyboardWitnessFailureCode::NativeFocusUnavailable
+                .at(KeyboardNativeRejection::AnchorUnavailable))
+        }
+    };
+    let scope = uia.scope.ok_or_else(|| {
+        KeyboardWitnessFailureCode::NativeFocusUnavailable
+            .at(KeyboardNativeRejection::AnchorUnavailable)
+    })?;
+    let refreshed_scope = crate::uia::cache::read_input_native_scope(scope, native.target)
+        .map_err(|_| {
+            KeyboardWitnessFailureCode::NativeFocusMismatch
+                .at(KeyboardNativeRejection::AnchorIdentity)
+        })?;
+    let actual = KeyboardNativeScopeWitness {
+        hwnd: uia.nearest_native_hwnd,
+        parent,
+        root,
+        thread,
+        pid,
     };
     if nearest.0.is_null()
         || !unsafe { IsWindow(nearest) }.as_bool()
-        || thread == 0
-        || pid != native.target_pid
-        || root != native.root
-        || !(nearest == focus || unsafe { IsChild(nearest, focus) }.as_bool())
+        || !keyboard_native_scope_matches(native, uia, scope, refreshed_scope, actual)
     {
-        return Err(KeyboardWitnessFailureCode::NativeFocusMismatch);
+        return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
+            .at(KeyboardNativeRejection::AnchorIdentity));
+    }
+    if !(nearest == focus || unsafe { IsChild(nearest, focus) }.as_bool()) {
+        return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
+            .at(KeyboardNativeRejection::AnchorFocusRelation));
     }
     let correlation = if uia.own_native_hwnd != 0
         && uia.own_native_hwnd == native.focus
@@ -733,31 +859,30 @@ fn native_keyboard_correlation(
         // Shared SDM/virtual control ancestor is correlation, not consumption.
         KeyboardNativeCorrelation::SharedAncestor
     };
-    Ok((
-        correlation,
-        KeyboardNativeScopeWitness {
-            hwnd: uia.nearest_native_hwnd,
-            parent,
-            root,
-            thread,
-            pid,
-        },
-    ))
+    Ok((correlation, actual))
 }
 fn read_final_keyboard_witness(
     hwnd: u64,
     expected_pid: u32,
     uia: crate::uia::cache::KeyboardUiaFocusWitness,
-) -> Result<(KeyboardNativeWitness, KeyboardNativeCorrelation), KeyboardWitnessFailureCode> {
+) -> Result<(KeyboardNativeWitness, KeyboardNativeCorrelation), KeyboardNativeReadFailure> {
     let initial = read_keyboard_native_witness(hwnd, expected_pid)?;
     let (correlation, initial_scope) = native_keyboard_correlation(initial, uia)?;
     let refresh = read_keyboard_native_witness(hwnd, expected_pid)?;
     let (_, refreshed_scope) = native_keyboard_correlation(refresh, uia)?;
-    // After all native-only scope/containment queries, the final GUI sample
-    // checks actual foreground + active/focus + target/root ownership again.
+    // Sample current foreground + active/focus + target/root, then bind exact
+    // physical anchor membership to THAT sample as well. Intermediate ancestor
+    // drift may leave the focus leaf/root and direct parent unchanged.
     let final_native = read_keyboard_native_witness(hwnd, expected_pid)?;
-    if initial != refresh || refresh != final_native || initial_scope != refreshed_scope {
-        return Err(KeyboardWitnessFailureCode::NativeFocusChanged);
+    let (final_correlation, final_scope) = native_keyboard_correlation(final_native, uia)?;
+    if initial != refresh
+        || refresh != final_native
+        || initial_scope != refreshed_scope
+        || refreshed_scope != final_scope
+        || correlation != final_correlation
+    {
+        return Err(KeyboardWitnessFailureCode::NativeFocusChanged
+            .at(KeyboardNativeRejection::NativeSnapshotChanged));
     }
     Ok((final_native, correlation))
 }
@@ -767,7 +892,7 @@ fn read_final_keyboard_witness(
 /// final callback performs native-only reads/correlation, then ONE insertion.
 fn dispatch_retained_key_once(
     mut witness: KeyboardFocusWitness,
-    read_before: impl FnOnce() -> Result<KeyboardNativeWitness, KeyboardWitnessFailureCode>,
+    read_before: impl FnOnce() -> Result<KeyboardNativeWitness, KeyboardNativeReadFailure>,
     read_uia: impl FnOnce() -> Result<
         crate::uia::cache::KeyboardUiaFocusWitness,
         crate::uia::cache::KeyboardUiaWitnessError,
@@ -776,13 +901,13 @@ fn dispatch_retained_key_once(
         crate::uia::cache::KeyboardUiaFocusWitness,
     ) -> Result<
         (KeyboardNativeWitness, KeyboardNativeCorrelation),
-        KeyboardWitnessFailureCode,
+        KeyboardNativeReadFailure,
     >,
     insert: impl FnOnce() -> u32,
     expected_events: u32,
 ) -> Result<KeyboardFocusWitness, KeyboardWitnessFailure> {
     use KeyboardWitnessFailureCode as Failure;
-    let before = read_before().map_err(|code| witness.clone().fail(code, None))?;
+    let before = read_before().map_err(|error| witness.clone().fail_native(error))?;
     witness.native_foreground_relation = KeyboardForegroundRelation::Exact;
     witness.native_gui_info_available = true;
     witness.native_active_within_boundary = Some(true);
@@ -810,7 +935,7 @@ fn dispatch_retained_key_once(
         return Err(witness.fail(Failure::UiaFocusMismatch, None));
     }
     let (final_native, correlation) =
-        read_final(uia).map_err(|code| witness.clone().fail(code, None))?;
+        read_final(uia).map_err(|error| witness.clone().fail_native(error))?;
     witness.native_foreground_stable = Some(
         before.foreground == final_native.foreground
             && before.foreground_thread == final_native.foreground_thread,
@@ -1276,6 +1401,7 @@ mod keyboard_focus_witness_tests {
             own_native_hwnd: 11,
             nearest_native_hwnd: 11,
             value_changed_on_focus: None,
+            scope: None,
         }
     }
     fn pending() -> KeyboardFocusWitness {
@@ -1392,7 +1518,7 @@ mod keyboard_focus_witness_tests {
         let calls = Cell::new(0);
         let error = dispatch_retained_key_once(
             pending(),
-            || Err(KeyboardWitnessFailureCode::NativeFocusUnavailable),
+            || Err(KeyboardWitnessFailureCode::NativeFocusUnavailable.into()),
             || panic!("no GUI witness must stop"),
             |_| panic!("no final read"),
             || {
@@ -1411,7 +1537,7 @@ mod keyboard_focus_witness_tests {
             pending(),
             || Ok(native()),
             || Ok(uia()),
-            |_| Err(KeyboardWitnessFailureCode::NativeFocusMismatch),
+            |_| Err(KeyboardWitnessFailureCode::NativeFocusMismatch.into()),
             || {
                 calls.set(1);
                 2
@@ -1460,7 +1586,7 @@ mod keyboard_focus_witness_tests {
             },
             |_| {
                 assert!(cleaned.get());
-                Err(KeyboardWitnessFailureCode::NativeFocusChanged)
+                Err(KeyboardWitnessFailureCode::NativeFocusChanged.into())
             },
             || {
                 calls.set(1);
@@ -1567,4 +1693,182 @@ pub(crate) fn dispatch_retained_key_for_owned_fixture(
         },
         2,
     )
+}
+
+#[cfg(test)]
+mod virtual_key_scope_tests {
+    use super::*;
+    use crate::uia::cache::{InputUiaOwnership, InputUiaScopeWitness, KeyboardUiaFocusWitness};
+    use std::cell::Cell;
+    fn native() -> KeyboardNativeWitness {
+        KeyboardNativeWitness {
+            target: 10,
+            target_thread: 2,
+            target_pid: 3,
+            root: 10,
+            foreground: 10,
+            foreground_thread: 2,
+            active: 10,
+            focus: 13,
+            focus_thread: 22,
+            focus_pid: 33,
+        }
+    }
+    fn scope() -> InputUiaScopeWitness {
+        InputUiaScopeWitness {
+            own_native_hwnd: 0,
+            nearest_native_hwnd: 12,
+            provider_pid: 77,
+            anchor_pid: 33,
+            anchor_thread: 22,
+            anchor_parent: 10,
+            anchor_root: 10,
+            ownership: InputUiaOwnership::VirtualDocument,
+        }
+    }
+    fn uia() -> KeyboardUiaFocusWitness {
+        KeyboardUiaFocusWitness {
+            has_focus: true,
+            focused_equals_target: true,
+            process_matches: true,
+            own_native_hwnd: 0,
+            nearest_native_hwnd: 12,
+            value_changed_on_focus: None,
+            scope: Some(scope()),
+        }
+    }
+    fn actual() -> KeyboardNativeScopeWitness {
+        KeyboardNativeScopeWitness {
+            hwnd: 12,
+            parent: 10,
+            root: 10,
+            thread: 22,
+            pid: 33,
+        }
+    }
+    fn dispatch(
+        actual: KeyboardNativeScopeWitness,
+        refreshed: InputUiaScopeWitness,
+        focus_within_anchor: bool,
+        calls: &Cell<u32>,
+    ) -> Result<KeyboardFocusWitness, KeyboardWitnessFailure> {
+        dispatch_retained_key_once(
+            KeyboardFocusWitness::pending(KeyboardElementReferenceKind::Token),
+            || Ok(native()),
+            || Ok(uia()),
+            |uia| {
+                if !keyboard_native_scope_matches(native(), uia, scope(), refreshed, actual) {
+                    return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
+                        .at(KeyboardNativeRejection::AnchorIdentity));
+                }
+                if !focus_within_anchor {
+                    return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
+                        .at(KeyboardNativeRejection::AnchorFocusRelation));
+                }
+                Ok((native(), KeyboardNativeCorrelation::SharedAncestor))
+            },
+            || {
+                calls.set(calls.get() + 1);
+                2
+            },
+            2,
+        )
+    }
+    fn assert_zero(
+        result: Result<KeyboardFocusWitness, KeyboardWitnessFailure>,
+        calls: &Cell<u32>,
+    ) {
+        let error = result.unwrap_err();
+        assert!(!error.witness.input_attempted);
+        assert_eq!(error.witness.inserted_event_count, 0);
+        assert_eq!(calls.get(), 0);
+    }
+    #[test]
+    fn proved_virtual_child_process_has_one_insertion_and_same_closed_wire() {
+        let calls = Cell::new(0);
+        let witness = dispatch(actual(), scope(), true, &calls).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(witness.uia_process_matches_target, Some(true));
+        assert_eq!(witness.inserted_event_count, 2);
+        let json = serde_json::to_value(&witness).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 18);
+        assert_eq!(json["nativeElementCorrelation"], "shared_ancestor");
+        assert!(json.get("providerPid").is_none());
+        assert!(json.get("ownership").is_none());
+    }
+    #[test]
+    fn wrong_root_native_scope_stops_before_sender() {
+        let calls = Cell::new(0);
+        let mut a = actual();
+        a.root = 20;
+        assert_zero(dispatch(a, scope(), true, &calls), &calls);
+    }
+    #[test]
+    fn same_root_sibling_focus_stops_before_sender() {
+        let calls = Cell::new(0);
+        assert_zero(dispatch(actual(), scope(), false, &calls), &calls);
+    }
+    #[test]
+    fn same_leaf_hwnd_intermediate_focus_reparent_stops_before_sender() {
+        let calls = Cell::new(0);
+        let error = dispatch(actual(), scope(), false, &calls).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("native_subreason=anchor_focus_relation;"));
+        assert_zero(Err(error), &calls);
+    }
+    #[test]
+    fn changed_anchor_parent_stops_before_sender() {
+        let calls = Cell::new(0);
+        let mut refreshed = scope();
+        refreshed.anchor_parent = 99;
+        assert_zero(dispatch(actual(), refreshed, true, &calls), &calls);
+    }
+    #[test]
+    fn native_anchor_reuse_with_different_owner_stops_before_sender() {
+        let calls = Cell::new(0);
+        let mut a = actual();
+        a.pid = 88;
+        assert_zero(dispatch(a, scope(), true, &calls), &calls);
+    }
+    #[test]
+    fn direct_native_path_still_requires_frame_process_focus() {
+        let mut expected = scope();
+        expected.ownership = InputUiaOwnership::DirectProcess;
+        assert!(!keyboard_native_scope_matches(
+            native(),
+            uia(),
+            expected,
+            expected,
+            actual()
+        ));
+    }
+    #[test]
+    fn primitive_native_subreasons_do_not_expand_or_leak_wire() {
+        let reasons = [
+            KeyboardNativeRejection::Foreground,
+            KeyboardNativeRejection::ForegroundThread,
+            KeyboardNativeRejection::GuiThreadQuery,
+            KeyboardNativeRejection::ActiveBoundary,
+            KeyboardNativeRejection::FocusBoundary,
+            KeyboardNativeRejection::FocusThread,
+            KeyboardNativeRejection::ForegroundChanged,
+            KeyboardNativeRejection::AdmittedTarget,
+            KeyboardNativeRejection::AnchorUnavailable,
+            KeyboardNativeRejection::AnchorIdentity,
+            KeyboardNativeRejection::AnchorFocusRelation,
+            KeyboardNativeRejection::NativeSnapshotChanged,
+        ];
+        for reason in reasons {
+            let failure = KeyboardFocusWitness::pending(KeyboardElementReferenceKind::Token)
+                .fail_native(KeyboardWitnessFailureCode::NativeFocusMismatch.at(reason));
+            assert!(failure
+                .to_string()
+                .contains(&format!("native_subreason={};", reason.as_str())));
+            let json = serde_json::to_value(&failure.witness).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 18);
+            assert_eq!(json["inputAttempted"], false);
+            assert_eq!(json["insertedEventCount"], 0);
+        }
+    }
 }
