@@ -1,6 +1,8 @@
 name: "E2E: Rust Windows interactive"
 
 on:
+  push:
+    branches: [source/issue344-canonical-windows-qa-20261010]
   workflow_dispatch:
     inputs:
       ref:
