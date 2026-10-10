@@ -356,4 +356,3 @@ jobs:
           name: rust-windows-matrix-summary
           path: matrix-summary.md
           if-no-files-found: error
-# Issue344: register this unchanged canonical all-lane workflow for exact immutable ref certification.
