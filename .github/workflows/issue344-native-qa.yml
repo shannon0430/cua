@@ -29,17 +29,25 @@ jobs:
         run: |
           & git config --global core.autocrlf false
           if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve exact source bytes' }
+          & git config --global core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve LF source bytes' }
 
       - name: Checkout exact pushed candidate
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # upstream v4 pin
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 32
           persist-credentials: false
 
       - name: Verify final source manifest and record honest QA scope
         run: |
           $ErrorActionPreference = 'Stop'
+          & git config --local core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot pin checkout byte policy' }
+          & git config --local core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot pin LF checkout policy' }
+          & git checkout-index --force --all
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot materialize exact LF checkout' }
           $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
           New-Item -ItemType Directory -Force $out | Out-Null
           $manifestPath = '.github/issue344-native-qa-manifest.json'
@@ -72,7 +80,10 @@ jobs:
             $entry = $entries[0]
             if ($entry.candidateSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Final source hash required' }
             $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
-            if ($actual -ne $entry.candidateSha256) { throw "Candidate source hash mismatch: $path" }
+            if ($actual -ne $entry.candidateSha256) {
+              & git ls-files --eol -- $path
+              throw "Candidate source hash mismatch: $path; expected $($entry.candidateSha256); actual $actual"
+            }
           }
           & git diff --check $base HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Whitespace check failed' }
