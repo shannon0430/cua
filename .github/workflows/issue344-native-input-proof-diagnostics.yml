@@ -49,7 +49,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic source must descend from exact a802 runtime' }
           $source = (& git rev-parse HEAD).Trim()
           if ($source -ne $env:GITHUB_SHA) { throw 'Exact diagnostic source mismatch' }
-      - name: Verify closed eight-path source against exact Git blobs
+      - name: Verify closed nine-path source against exact Git blobs
         shell: python
         run: |
           import hashlib, json, os, pathlib, subprocess
@@ -58,6 +58,7 @@ jobs:
           assert source==os.environ['GITHUB_SHA']
           paths=sorted([
               '.github/workflows/issue344-native-input-proof-diagnostics.yml',
+              'libs/cua-driver/docs/foreground-target-ownership.md',
               'libs/cua-driver/rust/crates/cua-driver/Cargo.toml',
               'libs/cua-driver/rust/crates/cua-driver/tests/cross_platform_behavior_test.rs',
               'libs/cua-driver/rust/crates/platform-windows/Cargo.toml',
@@ -67,10 +68,9 @@ jobs:
               'libs/cua-driver/rust/crates/platform-windows/src/input/proof_diagnostics.rs',
           ])
           changed=sorted(subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines())
-          assert changed==paths, 'Exact eight-path source closure required'
+          assert changed==paths, 'Exact nine-path source closure required'
           preserved=[
               'libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs',
-              'libs/cua-driver/docs/foreground-target-ownership.md',
               'scripts/ci/windows/run-rust-e2e.ps1',
               '.github/workflows/e2e-rust-windows.yml',
               'libs/cua-driver/rust/Cargo.lock',
@@ -104,6 +104,50 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Cannot select pinned toolchain' }
           $hostInfo = (& rustc +1.97.1 -vV) -join "`n"
           if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: x86_64-pc-windows-msvc') { throw 'Actual MSVC host required' }
+      - name: Run normal native units and verify every new parent test actually passed
+        working-directory: libs/cua-driver/rust
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'issue344-native-proof-diagnostics'
+          $ErrorActionPreference = 'Continue'
+          $unitOutput = @(& cargo +1.97.1 test --locked -p platform-windows --lib -- --test-threads=1 2>&1)
+          $unitExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $unitText = ($unitOutput | ForEach-Object { $_.ToString() }) -join "`n"
+          $unitOutput | Write-Host
+          $unitText | Set-Content -Encoding utf8 (Join-Path $out 'native-unit-tests.log')
+          $summary = [regex]::Match($unitText, 'test result: ok\. (\d+) passed; 0 failed; (\d+) ignored;')
+          if ($unitExit -ne 0 -or -not $summary.Success) { throw 'Normal native unit suite failed' }
+          $requiredTests = @(
+            'input::keyboard::virtual_key_scope_tests::virtual_immediate_root_parent_correlates_once_without_wire_expansion',
+            'input::keyboard::virtual_key_scope_tests::virtual_immediate_nonroot_parent_correlates_once',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_sibling_and_nonimmediate_root_focus_never_send',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_focus_owner_or_thread_mismatch_never_sends',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_semantic_focus_mismatch_or_missing_scope_never_sends',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_direct_native_root_anchor_and_native_leaf_never_send',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_anchor_identity_or_parent_drift_never_sends',
+            'input::keyboard::virtual_key_scope_tests::virtual_parent_final_foreground_active_focus_or_owner_drift_never_sends',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_immediate_root_parent_correlates_once',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_immediate_nonroot_parent_correlates_once',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_parent_sibling_and_nonimmediate_root_focus_never_send',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_parent_focus_owner_or_thread_mismatch_never_sends',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_parent_hover_or_scope_identity_drift_never_sends',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_parent_direct_native_root_anchor_and_native_leaf_never_send',
+            'input::mouse::virtual_wheel_ownership_tests::virtual_wheel_parent_final_focus_pid_thread_or_foreground_drift_never_sends'
+          )
+          foreach ($test in $requiredTests) {
+            $pattern = '(?m)^test ' + [regex]::Escape($test) + ' \.\.\. ok\r?$'
+            if ([regex]::Matches($unitText, $pattern).Count -ne 1) { throw 'Required parent test absent, duplicated or ignored' }
+          }
+          [ordered]@{ sourceCommit=$env:GITHUB_SHA; normalPassed=[int]$summary.Groups[1].Value; normalIgnored=[int]$summary.Groups[2].Value; requiredParentTests=$requiredTests; requiredParentPassed=$requiredTests.Count; requiredParentIgnored=0; nativeUnitsAccepted=$true; canonicalAllAccepted=$false; dellExcelAccepted=$false } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'native-unit-verification.json')
+          foreach ($fixture in @('uia::cache::keyboard_focus_owned_fixture_tests::owned_two_edit_exact_uia_and_gui_focus_positive_negative', 'tools::impl_::keyboard_owned_key_consumption_tests::owned_edit_home_shift_end_then_one_unicode_replacement')) {
+            $ErrorActionPreference = 'Continue'
+            $fixtureOutput = @(& cargo +1.97.1 test --locked -p platform-windows --lib $fixture -- --ignored --exact --nocapture --test-threads=1 2>&1)
+            $fixtureExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            $fixtureText = ($fixtureOutput | ForEach-Object { $_.ToString() }) -join "`n"
+            $fixtureOutput | Write-Host
+            if ($fixtureExit -ne 0 -or $fixtureText -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Existing owned native GUI fixture did not run and pass exactly once' }
+          }
       - name: Compile native source and exercise bounded encoder only
         working-directory: libs/cua-driver/rust
         run: |
@@ -113,6 +157,8 @@ jobs:
           $testExit = $LASTEXITCODE
           $testText = ($testOutput | ForEach-Object { $_.ToString() }) -join "`n"
           $testOutput | Write-Host
+          $out = Join-Path $env:RUNNER_TEMP 'issue344-native-proof-diagnostics'
+          $testText | Set-Content -Encoding utf8 (Join-Path $out 'native-encoder-tests.log')
           if ($testExit -ne 0 -or $testText -notmatch 'test result: ok\. 8 passed; 0 failed; 0 ignored;') { throw 'Exactly eight bounded encoder tests required' }
           & cargo +1.97.1 build --locked --release -p cua-driver --features native-input-proof-diagnostics
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic CLI build failed' }
@@ -164,13 +210,9 @@ jobs:
         if: always()
         shell: python
         run: |
-          import json, os, pathlib
-          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'issue344-native-proof-diagnostics'
-          p.mkdir(exist_ok=True)
+          import copy, json, os, pathlib
           expected={'windows-electron-scroll-px-foreground','windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground','windows-tauri-scroll-px-foreground'}
           expected_ops={cell:('retained_key' if cell in {'windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground'} else 'virtual_wheel') for cell in expected}
-          log=p/'four-case-original-harness.log'
-          rows=[]; current=None; begun=[]; ended=[]; error=None
           allowed_keys=set('schema operation phase inputAttempted gate predicates aliases target root foreground active focus hover ownNative providerAnchor anchorParent scope virtualDocument windowless nonRootNativeAnchor providerPidPositive providerProcessClass anchorProcessClass anchorThreadClass additionalObservation matchesGateSnapshot traversalBoundary cursorMatchesGate status unavailable nodeBound depthBound cycle byteBound nodes alias parent processClass threadClass readable withinAdmittedRoot anchorIdentityMatches hoverWithinAnchor focusWithinAnchor'.split())
           allowed_strings={'cua-native-input-proof-diagnostic/v1','retained_key','virtual_wheel','after_refusal','admittedRoot','complete','incomplete'}
           def normal_form(value, depth=0):
@@ -184,16 +226,29 @@ jobs:
               elif value is None or isinstance(value,bool): pass
               elif isinstance(value,int): assert 0<=value<128
               else: assert isinstance(value,str) and value in allowed_strings
-          try:
-              assert log.exists() and log.stat().st_size <= 8*1024*1024, 'bounded owning harness log missing'
-              for line in log.read_text(encoding='utf-8-sig').splitlines():
+
+          def collect(log_text, results, cases, environments, scope, source):
+              assert scope['sourceCommit']==source and scope['scope']=='diagnostic_four_owned_cases_only'
+              assert scope['baseRuntime']=='a80258ee1ff1e1b38ca87eb571f4552c3b853c54'
+              assert scope['canonicalAllAccepted'] is False and scope['packageAccepted'] is False and scope['dellExcelAccepted'] is False
+              assert len(results)==4 and {r['cell_id'] for r in results}==expected
+              assert all(r['test_status'] in {'pass','fail'} and r['expected_behavior']=={'kind':'deliver'} and 'fixture_state' in r['oracles'] for r in results)
+              assert len(cases)==4 and {r['cell_id'] for r in cases}==expected
+              assert all(r['expected_behavior']=={'kind':'deliver'} and 'fixture_state' in r['oracles'] for r in cases)
+              assert environments and all(e['source_sha']==source and e['status']=='ready' and e['platform']=='windows' and e['display_server']=='win32' for e in environments)
+              passed={r['cell_id'] for r in results if r['test_status']=='pass'}
+              assert all(r['observed_behavior']=='delivered' and set(r['oracles']).issubset(set(r['passed_oracles'])) for r in results if r['cell_id'] in passed)
+              failed=expected-passed
+              assert (scope['matrixExitCode']==0) == (not failed)
+              rows=[]; current=None; begun=[]; ended=[]
+              for line in log_text.splitlines():
                   for marker in ['CUA_NATIVE_INPUT_PROOF_CASE_V1 ', 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 ']:
                       if marker not in line: continue
                       value=line.split(marker,1)[1]
                       assert len((marker+value+'\n').encode()) <= 16384
                       item=json.loads(value)
                       if marker.startswith('CUA_NATIVE_INPUT_PROOF_CASE'):
-                          assert item['cellId'] in expected
+                          assert set(item)=={'cellId','phase'} and item['cellId'] in expected
                           if item['phase']=='begin':
                               assert current is None; current=item['cellId']; begun.append(current)
                           else:
@@ -201,30 +256,78 @@ jobs:
                               ended.append(current); current=None
                       else:
                           assert current in expected and item['schema']=='cua-native-input-proof-diagnostic/v1'
-                          normal_form(item) # reject any raw identity/content/schema expansion before artifact write
+                          normal_form(item)
                           assert item['phase']=='after_refusal' and item['inputAttempted'] is False
-                          assert item['operation']==expected_ops[current], 'Refusal operation must match its exact owned case'
+                          assert item['operation']==expected_ops[current]
                           assert len(item['additionalObservation'].get('nodes',[])) <= 64
-                          row={'cellId':current,'sourceCommit':os.environ['GITHUB_SHA'],'record':item}
+                          row={'cellId':current,'sourceCommit':source,'record':item}
                           assert len((json.dumps(row,separators=(',',':'))+'\n').encode()) <= 16384
                           rows.append(row)
               assert current is None and len(begun)==4 and set(begun)==expected and begun==ended
-              assert len(rows)==4 and {r['cellId'] for r in rows}==expected, 'one refusal record per required case was not measured'
+              # Success needs no refusal. Each failed original case still needs exactly
+              # one bound refusal; zero records never turns failure or missing effects into success.
+              assert len(rows)==len(failed) and {r['cellId'] for r in rows}==failed
+              return rows, not failed
+
+          def run_collector_regressions():
+              source='collector-source-selftest'
+              def fixture(failed):
+                  results=[]; cases=[]; lines=[]
+                  for cell in sorted(expected):
+                      cases.append({'cell_id':cell,'expected_behavior':{'kind':'deliver'},'oracles':['fixture_state']})
+                      results.append(dict(cases[-1],test_status='fail' if cell in failed else 'pass',observed_behavior='error' if cell in failed else 'delivered',passed_oracles=[] if cell in failed else ['fixture_state']))
+                      lines.append('CUA_NATIVE_INPUT_PROOF_CASE_V1 '+json.dumps({'cellId':cell,'phase':'begin'}))
+                      if cell in failed:
+                          record={'schema':'cua-native-input-proof-diagnostic/v1','operation':expected_ops[cell],'phase':'after_refusal','inputAttempted':False,'additionalObservation':{'status':'complete','matchesGateSnapshot':True,'nodes':[]}}
+                          lines.append('CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '+json.dumps(record))
+                      lines.append('CUA_NATIVE_INPUT_PROOF_CASE_V1 '+json.dumps({'cellId':cell,'phase':'end'}))
+                  environment=[{'source_sha':source,'status':'ready','platform':'windows','display_server':'win32'}]
+                  scope={'sourceCommit':source,'scope':'diagnostic_four_owned_cases_only','baseRuntime':'a80258ee1ff1e1b38ca87eb571f4552c3b853c54','matrixExitCode':1 if failed else 0,'canonicalAllAccepted':False,'packageAccepted':False,'dellExcelAccepted':False}
+                  return ['\n'.join(lines),results,cases,environment,scope,source]
+              names=[]
+              for name,failed in [('four_pass_zero_refusals',set()),('four_fail_four_refusals',expected),('mixed_original_outcomes',set(sorted(expected)[:2]))]:
+                  rows,all_pass=collect(*fixture(failed)); assert len(rows)==len(failed) and all_pass==(not failed); names.append(name)
+              for name in ['missing_refusal','duplicate_refusal','pass_missing_fixture_oracle','pass_with_refusal','stale_source','raw_schema','typed_skip','nonzero_exit_on_pass','duplicate_result','wrong_operation']:
+                  args=fixture(expected if name in {'missing_refusal','duplicate_refusal','raw_schema','wrong_operation'} else set())
+                  if name in {'missing_refusal','duplicate_refusal','raw_schema','wrong_operation'}:
+                      lines=args[0].splitlines(); i=next(i for i,l in enumerate(lines) if l.startswith('CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '))
+                      if name=='missing_refusal': lines.pop(i)
+                      elif name=='duplicate_refusal': lines.insert(i,lines[i])
+                      else:
+                          marker='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '; item=json.loads(lines[i][len(marker):])
+                          if name=='raw_schema': item['rawIdentity']=999999
+                          else: item['operation']='virtual_wheel' if item['operation']=='retained_key' else 'retained_key'
+                          lines[i]=marker+json.dumps(item)
+                      args[0]='\n'.join(lines)
+                  elif name=='pass_missing_fixture_oracle': args[1][0]['passed_oracles']=[]
+                  elif name=='pass_with_refusal': args[0]=fixture({sorted(expected)[0]})[0]
+                  elif name=='stale_source': args[3][0]['source_sha']='stale'
+                  elif name=='typed_skip': args[1][0]['test_status']='skip'
+                  elif name=='nonzero_exit_on_pass': args[4]['matrixExitCode']=1
+                  elif name=='duplicate_result': args[1][0]=copy.deepcopy(args[1][1])
+                  try: collect(*args)
+                  except (AssertionError,KeyError,TypeError,ValueError): names.append(name)
+                  else: raise AssertionError('Collector regression accepted invalid '+name)
+              assert len(names)==13
+              return names
+
+          regressions=run_collector_regressions()
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'issue344-native-proof-diagnostics'; p.mkdir(exist_ok=True)
+          rows=[]; all_pass=False; error=None
+          try:
+              log=p/'four-case-original-harness.log'
+              assert log.exists() and log.stat().st_size <= 8*1024*1024
+              inputs=[]
               for name in ['results.jsonl','cases.jsonl','environment.jsonl']:
-                  assert (p/name).exists() and (p/name).stat().st_size<=8*1024*1024
-              results=[json.loads(l) for l in (p/'results.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
-              assert len(results)==4 and {r['cell_id'] for r in results}==expected
-              assert all(r['test_status']!='skip' and r['expected_behavior']=={'kind':'deliver'} for r in results)
-              cases=[json.loads(l) for l in (p/'cases.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
-              assert len(cases)==4 and {r['cell_id'] for r in cases}==expected
-              assert all(r['expected_behavior']=={'kind':'deliver'} for r in cases)
-              environments=[json.loads(l) for l in (p/'environment.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
-              assert environments and all(e['source_sha']==os.environ['GITHUB_SHA'] and e['status']=='ready' and e['platform']=='windows' and e['display_server']=='win32' for e in environments)
+                  path=p/name; assert path.exists() and path.stat().st_size<=8*1024*1024
+                  inputs.append([json.loads(l) for l in path.read_text(encoding='utf-8-sig').splitlines() if l.strip()])
+              scope_path=p/'scope.json'; assert scope_path.exists() and scope_path.stat().st_size<=16384
+              rows,all_pass=collect(log.read_text(encoding='utf-8-sig'),*inputs,json.loads(scope_path.read_text(encoding='utf-8-sig')),os.environ['GITHUB_SHA'])
           except Exception as exc:
-              error=type(exc).__name__ # never dump provider/log/environment values
+              error=type(exc).__name__ # no provider/log/environment values
           with (p/'native-proof-diagnostics.jsonl').open('w',encoding='utf-8') as out:
               for row in rows: out.write(json.dumps(row,separators=(',',':'))+'\n')
-          (p/'diagnostic-collection.json').write_text(json.dumps({'sourceCommit':os.environ['GITHUB_SHA'],'records':len(rows),'collectionComplete':error is None,'relationsReadyForCorrection':error is None and all(r['record']['additionalObservation'].get('status')=='complete' and r['record']['additionalObservation'].get('matchesGateSnapshot') is True for r in rows),'errorClass':error,'canonicalAllAccepted':False,'inputProofAuthorizedByDiagnostics':False},indent=2)+'\n')
+          (p/'diagnostic-collection.json').write_text(json.dumps({'sourceCommit':os.environ['GITHUB_SHA'],'records':len(rows),'collectionComplete':error is None,'fourOriginalDeliverCasesAccepted':error is None and all_pass,'relationsReadyForCorrection':error is None and bool(rows) and all(r['record']['additionalObservation'].get('status')=='complete' and r['record']['additionalObservation'].get('matchesGateSnapshot') is True for r in rows),'collectorRegressionPassed':len(regressions),'collectorRegressionNames':regressions,'errorClass':error,'canonicalAllAccepted':False,'inputProofAuthorizedByDiagnostics':False},indent=2)+'\n')
           if error: raise SystemExit('Native relation measurement incomplete; existing failure is preserved')
       - name: Run existing owning result and trajectory report without changing acceptance
         if: always()
@@ -248,6 +351,9 @@ jobs:
             ${{ runner.temp }}/issue344-native-proof-diagnostics/source-byte-binding.json
             ${{ runner.temp }}/issue344-native-proof-diagnostics/native-proof-diagnostics.jsonl
             ${{ runner.temp }}/issue344-native-proof-diagnostics/diagnostic-collection.json
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/native-unit-tests.log
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/native-unit-verification.json
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/native-encoder-tests.log
             ${{ runner.temp }}/issue344-native-proof-diagnostics/scope.json
             ${{ runner.temp }}/issue344-native-proof-diagnostics/cases.jsonl
             ${{ runner.temp }}/issue344-native-proof-diagnostics/results.jsonl

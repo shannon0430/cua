@@ -28,8 +28,22 @@ The private `VirtualDocument` proof path additionally requires all of:
 - The anchor object's UIA PID equals the actual native anchor owner PID.
 - Document identity, anchor identity, leaf process and native anchor facts
   survive refresh, including any optional private ValuePattern equality read.
-- Final native foreground/thread/focus identities remain stable, and actual
-  native focus lies within that exact anchor.
+- Final native foreground/active/thread/focus identities remain stable. Native
+  focus is either within that exact anchor (the original path), or is its exact
+  immediate native parent with positive PID/thread equal to the anchor's owner.
+  The alternate requires the complete `VirtualDocument` proof and exact twice-
+  fresh retained-target UIA focus; it never admits a sibling, arbitrary ancestor,
+  owner window, same-PID window, or a root that is not that immediate parent.
+
+The immediate-parent alternate is **scope correlation**, reported with the
+existing `SharedAncestor` classification, not an exact physical-recipient or
+consumption guarantee. A host parent may contain several virtual anchors;
+incorrect provider focus or application-specific routing can still disagree
+with the intended recipient. Exact global UIA target/document identity is the
+semantic constraint, not parenthood or PID equality alone. Remaining external
+OS/provider races are not atomic, including changes inside a shared native host.
+Original independent application-effect oracles must prove consumption; until
+then insertion remains `Unverifiable` and is not Excel acceptance.
 
 No provider IDs, HWNDs, PIDs, names, text values, hashes of values or raw provider
 errors are added to the diagnostic payload. COM interface release and apartment
@@ -45,8 +59,13 @@ selects a row or retries to satisfy it.
 Only a fully proved windowless Document fragment may use hover semantics with
 keyboard focus elsewhere in that same exact document and native child anchor.
 Unrelated documents, sibling native anchors and foreign roots refuse before
-wheel insertion. Anchor ownership and hover/focus physical containment are
-checked against the latest native sample, not only the initial sample. An
+wheel insertion. Physical hover must remain within that anchor. Native focus
+must remain within it or equal its exact immediate native parent with matching
+positive anchor/focus PID and thread; all semantic document/focus/hover identities
+remain twice-fresh. Focus PID/thread are recorded in every private native sample
+and participate in complete before/after equality, not inferred from diagnostics.
+Anchor ownership and exact parent correlation are checked against the latest
+native sample, not only the initial sample. An
 intermediate ancestor reparent is a refusal even when leaf HWNDs/root are
 unchanged. A missing Document/anchor proof never becomes a broad frame permit.
 
@@ -78,7 +97,8 @@ fixed native refusal subreasons precede the marker, without changing the wire.
 
 1. Pin Rust1.97.1 and Windows MSVC, compile production and test targets.
 2. Run the original native unit/SDK gates, the 27 new source-bound policy,
-   dispatch, anchor-drift and privacy cases, and the two existing owned two-Edit
+   dispatch, anchor-drift and privacy cases, the new virtual-parent production-
+   seam positives/zero-sender negatives, and the two existing owned two-Edit
    GUI fixtures. Portable extraction is only helper proof, not Win32/UIA proof.
 3. Run all 86 unchanged canonical cells with their original application effect
    oracles, 0 typed skips and complete video/trajectory evidence. The actual

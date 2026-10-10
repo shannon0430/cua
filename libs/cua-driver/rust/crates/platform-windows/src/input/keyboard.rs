@@ -803,6 +803,46 @@ fn keyboard_native_scope_matches(
         }
 }
 
+/// Physical descendant correlation is unchanged. A fully proved virtual
+/// Document may instead correlate to its exact immediate native host parent.
+/// Semantic focus was refreshed before COM teardown; this is not consumption.
+fn keyboard_native_focus_relation_admitted(
+    native: KeyboardNativeWitness,
+    uia: crate::uia::cache::KeyboardUiaFocusWitness,
+    actual: KeyboardNativeScopeWitness,
+    focus_within_anchor: bool,
+) -> bool {
+    use crate::uia::cache::InputUiaOwnership;
+    if focus_within_anchor {
+        return true;
+    }
+    let Some(scope) = uia.scope else {
+        return false;
+    };
+    uia.has_focus
+        && uia.focused_equals_target
+        && uia.process_matches
+        && scope.ownership == InputUiaOwnership::VirtualDocument
+        && scope.provider_pid > 0
+        && scope.own_native_hwnd == 0
+        && uia.own_native_hwnd == 0
+        && scope.nearest_native_hwnd == actual.hwnd
+        && uia.nearest_native_hwnd == actual.hwnd
+        && actual.hwnd != 0
+        && actual.hwnd != native.root
+        && scope.anchor_root == native.root
+        && actual.root == native.root
+        && actual.parent != 0
+        && scope.anchor_parent == actual.parent
+        && native.focus == actual.parent
+        && actual.pid != 0
+        && actual.thread != 0
+        && scope.anchor_pid == actual.pid
+        && scope.anchor_thread == actual.thread
+        && native.focus_pid == actual.pid
+        && native.focus_thread == actual.thread
+}
+
 fn native_keyboard_correlation(
     native: KeyboardNativeWitness,
     uia: crate::uia::cache::KeyboardUiaFocusWitness,
@@ -847,7 +887,7 @@ fn native_keyboard_correlation(
             .at(KeyboardNativeRejection::AnchorIdentity));
     }
     let focus_within_anchor = nearest == focus || unsafe { IsChild(nearest, focus) }.as_bool();
-    if !focus_within_anchor {
+    if !keyboard_native_focus_relation_admitted(native, uia, actual, focus_within_anchor) {
         // Diagnostic-only observer runs after this refusal decision. It cannot
         // authorize input and adds nothing to the accepted proof -> SendInput path.
         #[cfg(feature = "native-input-proof-diagnostics")]
@@ -1786,7 +1826,12 @@ mod virtual_key_scope_tests {
                     return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
                         .at(KeyboardNativeRejection::AnchorIdentity));
                 }
-                if !focus_within_anchor {
+                if !keyboard_native_focus_relation_admitted(
+                    native(),
+                    uia,
+                    actual,
+                    focus_within_anchor,
+                ) {
                     return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
                         .at(KeyboardNativeRejection::AnchorFocusRelation));
                 }
@@ -1867,6 +1912,207 @@ mod virtual_key_scope_tests {
             expected,
             actual()
         ));
+    }
+    fn parent_native(parent: u64) -> KeyboardNativeWitness {
+        KeyboardNativeWitness {
+            focus: parent,
+            ..native()
+        }
+    }
+    fn parent_dispatch(
+        before: KeyboardNativeWitness,
+        final_native: KeyboardNativeWitness,
+        semantic: KeyboardUiaFocusWitness,
+        refreshed: InputUiaScopeWitness,
+        actual: KeyboardNativeScopeWitness,
+        calls: &Cell<u32>,
+    ) -> Result<KeyboardFocusWitness, KeyboardWitnessFailure> {
+        dispatch_retained_key_once(
+            KeyboardFocusWitness::pending(KeyboardElementReferenceKind::Token),
+            || Ok(before),
+            || Ok(semantic),
+            |uia| {
+                let expected = uia.scope.ok_or_else(|| {
+                    KeyboardWitnessFailureCode::NativeFocusUnavailable
+                        .at(KeyboardNativeRejection::AnchorUnavailable)
+                })?;
+                if !keyboard_native_scope_matches(final_native, uia, expected, refreshed, actual)
+                    || !keyboard_native_focus_relation_admitted(final_native, uia, actual, false)
+                {
+                    return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
+                        .at(KeyboardNativeRejection::AnchorFocusRelation));
+                }
+                Ok((final_native, KeyboardNativeCorrelation::SharedAncestor))
+            },
+            || {
+                calls.set(calls.get() + 1);
+                2
+            },
+            2,
+        )
+    }
+    #[test]
+    fn virtual_immediate_root_parent_correlates_once_without_wire_expansion() {
+        let calls = Cell::new(0);
+        let native = parent_native(10);
+        let result = parent_dispatch(native, native, uia(), scope(), actual(), &calls).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.inserted_event_count, 2);
+        assert_eq!(
+            result.native_element_correlation,
+            KeyboardNativeCorrelation::SharedAncestor
+        );
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 18);
+        assert_eq!(wire["nativeElementCorrelation"], "shared_ancestor");
+        assert!(wire.get("providerPid").is_none());
+    }
+    #[test]
+    fn virtual_immediate_nonroot_parent_correlates_once() {
+        let calls = Cell::new(0);
+        let native = parent_native(11);
+        let mut expected = scope();
+        expected.anchor_parent = 11;
+        let mut semantic = uia();
+        semantic.scope = Some(expected);
+        parent_dispatch(
+            native,
+            native,
+            semantic,
+            expected,
+            KeyboardNativeScopeWitness {
+                parent: 11,
+                ..actual()
+            },
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn virtual_parent_sibling_and_nonimmediate_root_focus_never_send() {
+        for focus in [10, 13, 14] {
+            let calls = Cell::new(0);
+            let native = parent_native(focus);
+            let mut expected = scope();
+            expected.anchor_parent = 11;
+            let mut semantic = uia();
+            semantic.scope = Some(expected);
+            assert_zero(
+                parent_dispatch(
+                    native,
+                    native,
+                    semantic,
+                    expected,
+                    KeyboardNativeScopeWitness {
+                        parent: 11,
+                        ..actual()
+                    },
+                    &calls,
+                ),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_parent_focus_owner_or_thread_mismatch_never_sends() {
+        for (pid, thread) in [(0, 22), (33, 0), (44, 22), (33, 44)] {
+            let calls = Cell::new(0);
+            let native = KeyboardNativeWitness {
+                focus_pid: pid,
+                focus_thread: thread,
+                ..parent_native(10)
+            };
+            assert_zero(
+                parent_dispatch(native, native, uia(), scope(), actual(), &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_parent_semantic_focus_mismatch_or_missing_scope_never_sends() {
+        for variant in 0..4 {
+            let calls = Cell::new(0);
+            let native = parent_native(10);
+            let mut semantic = uia();
+            match variant {
+                0 => semantic.has_focus = false,
+                1 => semantic.focused_equals_target = false,
+                2 => semantic.process_matches = false,
+                _ => semantic.scope = None,
+            }
+            assert_zero(
+                parent_dispatch(native, native, semantic, scope(), actual(), &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_parent_direct_native_root_anchor_and_native_leaf_never_send() {
+        for variant in 0..3 {
+            let calls = Cell::new(0);
+            let mut native = parent_native(10);
+            let mut semantic = uia();
+            let mut expected = scope();
+            let mut actual = actual();
+            match variant {
+                0 => {
+                    expected.ownership = InputUiaOwnership::DirectProcess;
+                    expected.provider_pid = 33;
+                    native.target_pid = 33;
+                }
+                1 => {
+                    expected.nearest_native_hwnd = 10;
+                    semantic.nearest_native_hwnd = 10;
+                    actual.hwnd = 10;
+                }
+                _ => {
+                    expected.own_native_hwnd = 12;
+                    semantic.own_native_hwnd = 12;
+                }
+            }
+            semantic.scope = Some(expected);
+            assert_zero(
+                parent_dispatch(native, native, semantic, expected, actual, &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_parent_anchor_identity_or_parent_drift_never_sends() {
+        for variant in 0..4 {
+            let calls = Cell::new(0);
+            let native = parent_native(10);
+            let mut refreshed = scope();
+            match variant {
+                0 => refreshed.anchor_parent = 99,
+                1 => refreshed.anchor_pid = 99,
+                2 => refreshed.anchor_thread = 99,
+                _ => refreshed.anchor_root = 99,
+            }
+            assert_zero(
+                parent_dispatch(native, native, uia(), refreshed, actual(), &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_parent_final_foreground_active_focus_or_owner_drift_never_sends() {
+        for variant in 0..4 {
+            let calls = Cell::new(0);
+            let before = parent_native(10);
+            let mut after = before;
+            match variant {
+                0 => after.foreground_thread += 1,
+                1 => after.active = 11,
+                2 => after.focus = 11,
+                _ => after.focus_pid += 1,
+            }
+            assert_zero(
+                parent_dispatch(before, after, uia(), scope(), actual(), &calls),
+                &calls,
+            );
+        }
     }
     #[test]
     fn primitive_native_subreasons_do_not_expand_or_leak_wire() {

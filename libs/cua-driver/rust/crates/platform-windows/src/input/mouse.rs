@@ -1291,6 +1291,31 @@ fn virtual_wheel_relation_admitted(
         && hover_within_anchor
         && focus_within_anchor
 }
+/// Preserve physical containment, or correlate the fully proved virtual
+/// document to its exact immediate native host parent. This is scope only;
+/// original fixture/readback oracles still determine wheel consumption.
+fn virtual_wheel_native_focus_relation_admitted(
+    expected: crate::uia::cache::InputUiaScopeWitness,
+    actual: crate::uia::cache::InputUiaScopeWitness,
+    latest: &WheelNativeWitness,
+    hover_within_anchor: bool,
+    focus_within_anchor: bool,
+) -> bool {
+    if virtual_wheel_relation_admitted(expected, actual, hover_within_anchor, focus_within_anchor) {
+        return true;
+    }
+    virtual_wheel_relation_admitted(expected, actual, hover_within_anchor, true)
+        && expected.provider_pid > 0
+        && expected.nearest_native_hwnd != 0
+        && expected.anchor_root == latest.root
+        && expected.anchor_parent != 0
+        && latest.focus == expected.anchor_parent
+        && expected.anchor_pid != 0
+        && expected.anchor_thread != 0
+        && latest.focus_pid == expected.anchor_pid
+        && latest.focus_thread == expected.anchor_thread
+}
+
 fn confirm_virtual_wheel_native_relation(
     anchor: crate::uia::cache::InputUiaScopeWitness,
     target: HWND,
@@ -1306,8 +1331,13 @@ fn confirm_virtual_wheel_native_relation(
     };
     let hover_within_anchor = belongs(latest.hover);
     let focus_within_anchor = belongs(latest.focus);
-    if !virtual_wheel_relation_admitted(anchor, refreshed, hover_within_anchor, focus_within_anchor)
-    {
+    if !virtual_wheel_native_focus_relation_admitted(
+        anchor,
+        refreshed,
+        latest,
+        hover_within_anchor,
+        focus_within_anchor,
+    ) {
         // One bounded private record only after the original guard refused.
         #[cfg(feature = "native-input-proof-diagnostics")]
         super::proof_diagnostics::record_refusal(
@@ -1321,8 +1351,8 @@ fn confirm_virtual_wheel_native_relation(
                 active: None, // the wheel guard did not sample native active HWND
                 focus: latest.focus,
                 hover: Some(latest.hover),
-                focus_pid: None, // these identities are additional observation, not gate facts
-                focus_thread: None,
+                focus_pid: Some(latest.focus_pid), // exact sampled gate identities, not observer facts
+                focus_thread: Some(latest.focus_thread),
                 point: Some(latest.cursor),
                 scope: anchor.into(),
             },
@@ -1361,6 +1391,8 @@ struct WheelNativeWitness {
     hover_root: u64,
     hover_in_target: bool,
     focus: u64,
+    focus_pid: u32,
+    focus_thread: u32,
     focus_root: u64,
     focus_in_target: bool,
 }
@@ -1389,6 +1421,10 @@ fn read_wheel_native_witness(
         ..Default::default()
     };
     unsafe { GetGUIThreadInfo(root_thread, &mut info) }?;
+    // Every sample carries the actual focus owner/thread. Complete witness
+    // equality fences these identities across provider work and final passes.
+    let mut focus_pid = 0;
+    let focus_thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, Some(&mut focus_pid)) };
     let mut cursor = POINT::default();
     unsafe { GetCursorPos(&mut cursor) }?;
     let witness = WheelNativeWitness {
@@ -1405,6 +1441,8 @@ fn read_wheel_native_witness(
         hover_root: unsafe { GetAncestor(hover, GA_ROOT) }.0 as u64,
         hover_in_target: hover == target || unsafe { IsChild(target, hover) }.as_bool(),
         focus: info.hwndFocus.0 as u64,
+        focus_pid,
+        focus_thread,
         focus_root: unsafe { GetAncestor(info.hwndFocus, GA_ROOT) }.0 as u64,
         focus_in_target: info.hwndFocus == target
             || unsafe { IsChild(target, info.hwndFocus) }.as_bool(),
@@ -1433,6 +1471,8 @@ fn wheel_native_witness_valid(
         && w.hover_root == w.root
         && w.hover_in_target
         && w.focus != 0
+        && w.focus_pid != 0
+        && w.focus_thread != 0
         && w.focus_root == w.root
         && w.focus_in_target
 }
@@ -1624,6 +1664,8 @@ mod wheel_target_admission_tests {
             hover_root: 10,
             hover_in_target: true,
             focus: 13,
+            focus_pid: 100,
+            focus_thread: 200,
             focus_root: 10,
             focus_in_target: true,
         }
@@ -1994,6 +2036,159 @@ mod virtual_wheel_ownership_tests {
             true,
             true
         ));
+    }
+    fn parent_native(parent: u64) -> WheelNativeWitness {
+        WheelNativeWitness {
+            target: 10,
+            target_pid: 3,
+            target_thread: 2,
+            target_root: 10,
+            root: 10,
+            root_pid: 3,
+            root_thread: 2,
+            foreground: 10,
+            cursor: (1, 2),
+            hover: 12,
+            hover_root: 10,
+            hover_in_target: true,
+            focus: parent,
+            focus_pid: 33,
+            focus_thread: 22,
+            focus_root: 10,
+            focus_in_target: true,
+        }
+    }
+    fn parent_dispatch(
+        expected: InputUiaScopeWitness,
+        refreshed: InputUiaScopeWitness,
+        before: WheelNativeWitness,
+        after: WheelNativeWitness,
+        hover_within_anchor: bool,
+        calls: &std::cell::Cell<u32>,
+    ) -> Result<()> {
+        insert_wheel_after_admission(
+            || {
+                if !wheel_native_witness_valid(&after, 3, (1, 2))
+                    || !wheel_native_witness_unchanged(&before, &after)
+                    || !virtual_wheel_native_focus_relation_admitted(
+                        expected,
+                        refreshed,
+                        &after,
+                        hover_within_anchor,
+                        false,
+                    )
+                {
+                    bail!("virtual host scope not stable; no input");
+                }
+                Ok(())
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+    }
+    fn assert_parent_zero(result: Result<()>, calls: &std::cell::Cell<u32>) {
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0);
+    }
+    #[test]
+    fn virtual_wheel_immediate_root_parent_correlates_once() {
+        let calls = std::cell::Cell::new(0);
+        let native = parent_native(10);
+        parent_dispatch(anchor(), anchor(), native, native, true, &calls).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn virtual_wheel_immediate_nonroot_parent_correlates_once() {
+        let calls = std::cell::Cell::new(0);
+        let native = parent_native(11);
+        let mut expected = anchor();
+        expected.anchor_parent = 11;
+        parent_dispatch(expected, expected, native, native, true, &calls).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn virtual_wheel_parent_sibling_and_nonimmediate_root_focus_never_send() {
+        for focus in [10, 13, 14] {
+            let calls = std::cell::Cell::new(0);
+            let native = parent_native(focus);
+            let mut expected = anchor();
+            expected.anchor_parent = 11;
+            assert_parent_zero(
+                parent_dispatch(expected, expected, native, native, true, &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_wheel_parent_focus_owner_or_thread_mismatch_never_sends() {
+        for (pid, thread) in [(0, 22), (33, 0), (44, 22), (33, 44)] {
+            let calls = std::cell::Cell::new(0);
+            let native = WheelNativeWitness {
+                focus_pid: pid,
+                focus_thread: thread,
+                ..parent_native(10)
+            };
+            assert_parent_zero(
+                parent_dispatch(anchor(), anchor(), native, native, true, &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_wheel_parent_hover_or_scope_identity_drift_never_sends() {
+        for variant in 0..5 {
+            let calls = std::cell::Cell::new(0);
+            let native = parent_native(10);
+            let mut refreshed = anchor();
+            match variant {
+                0 => refreshed.anchor_parent = 99,
+                1 => refreshed.anchor_pid = 99,
+                2 => refreshed.anchor_thread = 99,
+                3 => refreshed.anchor_root = 99,
+                _ => {}
+            }
+            assert_parent_zero(
+                parent_dispatch(anchor(), refreshed, native, native, variant != 4, &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_wheel_parent_direct_native_root_anchor_and_native_leaf_never_send() {
+        for variant in 0..3 {
+            let calls = std::cell::Cell::new(0);
+            let native = parent_native(10);
+            let mut expected = anchor();
+            match variant {
+                0 => expected.ownership = InputUiaOwnership::DirectProcess,
+                1 => expected.nearest_native_hwnd = 10,
+                _ => expected.own_native_hwnd = 12,
+            }
+            assert_parent_zero(
+                parent_dispatch(expected, expected, native, native, true, &calls),
+                &calls,
+            );
+        }
+    }
+    #[test]
+    fn virtual_wheel_parent_final_focus_pid_thread_or_foreground_drift_never_sends() {
+        for variant in 0..4 {
+            let calls = std::cell::Cell::new(0);
+            let before = parent_native(10);
+            let mut after = before;
+            match variant {
+                0 => after.focus_pid += 1,
+                1 => after.focus_thread += 1,
+                2 => after.foreground = 11,
+                _ => after.focus = 11,
+            }
+            assert_parent_zero(
+                parent_dispatch(anchor(), anchor(), before, after, true, &calls),
+                &calls,
+            );
+        }
     }
     #[test]
     fn native_sdm_proof_cannot_enter_virtual_hover_relaxation() {
