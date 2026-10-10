@@ -417,7 +417,7 @@ pub(crate) mod keyboard_focus_owned_fixture_tests {
                     20,
                     280,
                     25,
-                    Some(top),
+                    top,
                     None,
                     instance,
                     None,
@@ -432,7 +432,7 @@ pub(crate) mod keyboard_focus_owned_fixture_tests {
                     60,
                     280,
                     25,
-                    Some(top),
+                    top,
                     None,
                     instance,
                     None,
@@ -442,7 +442,7 @@ pub(crate) mod keyboard_focus_owned_fixture_tests {
                 // must produce an observed change rather than a trivial no-op.
                 SendMessageW(first, 0x00b1, WPARAM(10), LPARAM(10)); // EM_SETSEL
                 let _ = SetForegroundWindow(top);
-                let _ = SetFocus(Some(first));
+                let _ = SetFocus(first);
                 ready_tx
                     .send((
                         top.0 as usize as u64,
@@ -454,7 +454,7 @@ pub(crate) mod keyboard_focus_owned_fixture_tests {
                     match receive.try_recv() {
                         Ok(FixtureCommand::Focus(use_second)) => {
                             let _ = SetForegroundWindow(top);
-                            let _ = SetFocus(Some(if use_second { second } else { first }));
+                            let _ = SetFocus(if use_second { second } else { first });
                             ack_tx.send(FixtureAcknowledgment::Focused).unwrap();
                         }
                         Ok(FixtureCommand::Observe(use_second)) => {

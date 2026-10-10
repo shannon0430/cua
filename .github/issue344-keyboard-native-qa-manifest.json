@@ -2,7 +2,7 @@
   "sourceStatus": "author_frozen_for_native_qa",
   "baseCommit": "36987990b292537770fe2df3a9e6dee2ef43db2f",
   "baseCandidatePatchSha256": "02a81b766a75f1ca24db9b453d3c8545d469dbf328d9c3df79ec3892c0a1fc21",
-  "keyboardWitnessPatchSha256": "996046b4e93b8c14de8d9d20c51aa53c75bc0064fb5441b3b4413ce7c996b883",
+  "keyboardWitnessPatchSha256": "dd7e4d1964915213cf2f56e611ce84c2727dc51a967431c508c3ceac87f0c3cd",
   "files": [
     {
       "path": "libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs",
@@ -26,7 +26,7 @@
       "path": "libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs",
       "originalSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
       "priorCandidateSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
-      "candidateSha256": "2a0ec24d9202b0971c82b7e4208552d46ce586f27a06ccc7a139070b4f3fc642"
+      "candidateSha256": "4d38b2e8f57174766f14af53c9979acf5da14ac972f57b79dff00ca346b49874"
     }
   ],
   "nativeQa": {
@@ -110,7 +110,10 @@
     "expectedOwnedFixtures": 2,
     "ownedKeyMetadataAssertion": "same production result owner; marker18 fields/actual delivered_count/effect/route/delivery projection consistency for each actual owned key; numeric SDK2/2/1 mapping source reviewed, not SDK OS transport runtime"
   },
-  "authorManifestSha256": "8ca4ce8b16aceefbf600a0fdaa75f90c43a8ecd3faec8e7ed51159965576b7f1",
-  "sourceReviewBoundary": "metadata-v2 author final static/source/serialization review; parent fresh review and exact Windows QA pending",
-  "cumulativePatchRule": "public base + immutable02a81 + metadata-v2 996046 only; do not stack ab5 or separate COM patch"
+  "authorManifestSha256": "fca92fc17632e8a2465f3008b8cc8f6d776f3ddcbcd4cbde6ca46beab0edc27d",
+  "sourceReviewBoundary": "fixture-v3 author freeze and independent exact four cfg(test) HWND corrections review PASS; native compile/668+2 fixtures/Node24 import pending",
+  "cumulativePatchRule": "public base + immutable02a81 + fixture-v3 dd7e cumulative only; do not stack996046/ab5 or separate COM patch; existing1173 source correction uses exact v2-to-v3 incremental patch only",
+  "fixtureOnlyPredecessorQaManifestSha256": "28f3e4f8b106eb0f23563df7ade3fe2f3b3ab18b79b5ebc481e3a592e63f59a6",
+  "fixtureOnlyIncrementalPatchSha256": "3f127014a13c3102e3ffe102dadb9f72bea41a0631e463d752ed629cc5519003",
+  "independentFixtureReviewSha256": "6ccda62f4aa37a29ea7462e2db1510096faab7cd56a1b84395802b3bbfeea7a2"
 }
