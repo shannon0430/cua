@@ -95,7 +95,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           & .\scripts\ci\windows\verify-user-session.ps1
-          if ($LASTEXITCODE -ne 0) { throw 'Interactive desktop required; no GUI skip' }
+          if (-not $?) { throw 'Interactive desktop required; no GUI skip' }
           & .\scripts\ci\windows\setup-ffmpeg.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Canonical trajectory tooling required' }
           & rustup toolchain install 1.97.1 --profile minimal
