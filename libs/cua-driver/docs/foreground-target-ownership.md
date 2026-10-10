@@ -112,3 +112,33 @@ fixed native refusal subreasons precede the marker, without changing the wire.
 6. After separately controlled activation, perform synthetic standard-tool
    Excel selection/replacement/scroll acceptance and readback. This source
    compatibility change is not an asserted remedy for the original Excel issue.
+
+## Default-off late key refusal observation (v2; not acceptance)
+
+The private diagnostic feature preserves the exact `before != final_native`
+refusal after the final native correlation succeeds. Only that already-decided
+refusal emits `cua-native-input-proof-diagnostic/v2`, fixed stage
+`pre_uia_vs_final_native`. Its closed `gate.nativeSnapshotEquality` contains
+exactly ten booleans: target, targetThread, targetPid, root, foreground,
+foregroundThread, active, focus, focusThread and focusPid. These compare the
+already-read pre-UIA and final native tuples; no raw identities or content are
+serialized. At least one must be false. The admitted final native correlation
+is a captured proof fact, not a fresh IsChild or physical recipient claim.
+
+The bounded anonymous graph is a separate post-refusal observation of the final
+gate. A complete ten-field equality vector remains available even if that later
+graph is unreadable or has drifted. Relations are ready for diagnostic review
+only when the graph is complete and matches the final gate sample as well.
+The collector rejects wrong stage, malformed/missing/duplicate or raw equality,
+and checks nativeForegroundStable/nativeFocusStable against the original failed
+key wire when it is available. Diagnostic completeness never converts a failed
+original fixture_state effect into success. V1 refusal records remain supported.
+
+The feature is default-off, the public 18-field witness is unchanged, and there
+is no observer on the accepted path, actuator, retry, wait or ownership fallback.
+The original four deliver cases, 15 normal parent tests, two owned GUI fixtures,
+zero-skip RequireGui gates, full 86/43/9 declarations and all effect oracles remain
+required. The encoder suite preserves its original eight tests and adds four
+late-refusal tests; a separate ten-field drift sender-seam test checks zero sends.
+Portable Rust and Python checks are source-only helper verification, not native
+Windows, full canonical, package or Excel acceptance.

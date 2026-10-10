@@ -690,6 +690,56 @@ struct KeyboardNativeWitness {
     focus_thread: u32,
     focus_pid: u32,
 }
+#[cfg(feature = "native-input-proof-diagnostics")]
+impl From<KeyboardNativeWitness> for super::proof_diagnostics::KeyNativeTuple {
+    fn from(native: KeyboardNativeWitness) -> Self {
+        Self {
+            target: native.target,
+            target_thread: native.target_thread,
+            target_pid: native.target_pid,
+            root: native.root,
+            foreground: native.foreground,
+            foreground_thread: native.foreground_thread,
+            active: native.active,
+            focus: native.focus,
+            focus_thread: native.focus_thread,
+            focus_pid: native.focus_pid,
+        }
+    }
+}
+
+#[cfg(feature = "native-input-proof-diagnostics")]
+fn record_late_keyboard_tuple_refusal(
+    before: KeyboardNativeWitness,
+    final_native: KeyboardNativeWitness,
+    uia: crate::uia::cache::KeyboardUiaFocusWitness,
+) {
+    // The final native read/correlation succeeded. Never fabricate a missing
+    // scope or claim a fresh IsChild observation was that original correlation.
+    let Some(scope) = uia.scope else {
+        return;
+    };
+    super::proof_diagnostics::record_key_tuple_refusal(
+        super::proof_diagnostics::Snapshot {
+            target: final_native.target,
+            root: final_native.root,
+            target_pid: final_native.target_pid,
+            target_thread: final_native.target_thread,
+            root_thread: final_native.foreground_thread,
+            foreground: final_native.foreground,
+            active: Some(final_native.active),
+            focus: final_native.focus,
+            hover: None,
+            focus_pid: Some(final_native.focus_pid),
+            focus_thread: Some(final_native.focus_thread),
+            point: None,
+            scope: scope.into(),
+        },
+        before.into(),
+        final_native.into(),
+    );
+}
+
 fn read_keyboard_native_witness(
     hwnd: u64,
     expected_pid: u32,
@@ -1008,6 +1058,10 @@ fn dispatch_retained_key_once(
     witness.native_focus_stable = Some(before == final_native);
     witness.native_element_correlation = correlation;
     if before != final_native {
+        // The unchanged refusal is already decided; diagnostics cannot send or
+        // retry, and are compiled out of the default production input path.
+        #[cfg(feature = "native-input-proof-diagnostics")]
+        record_late_keyboard_tuple_refusal(before, final_native, uia);
         return Err(witness.fail(Failure::NativeFocusChanged, None));
     }
     if matches!(correlation, KeyboardNativeCorrelation::Unavailable) {
@@ -1631,6 +1685,49 @@ mod keyboard_focus_witness_tests {
         .unwrap_err();
         assert_eq!(error.witness.native_focus_stable, Some(false));
         assert_not_inserted(error, &calls);
+    }
+    #[cfg(feature = "native-input-proof-diagnostics")]
+    #[test]
+    fn late_tuple_each_field_drift_refuses_with_zero_sender_calls() {
+        for field in 0..10 {
+            let calls = Cell::new(0);
+            let mut final_native = native();
+            match field {
+                0 => final_native.target += 1,
+                1 => final_native.target_thread += 1,
+                2 => final_native.target_pid += 1,
+                3 => final_native.root += 1,
+                4 => final_native.foreground += 1,
+                5 => final_native.foreground_thread += 1,
+                6 => final_native.active += 1,
+                7 => final_native.focus += 1,
+                8 => final_native.focus_thread += 1,
+                9 => final_native.focus_pid += 1,
+                _ => unreachable!(),
+            }
+            let error = dispatch_retained_key_once(
+                pending(),
+                || Ok(native()),
+                || Ok(uia()),
+                |_| Ok((final_native, KeyboardNativeCorrelation::SharedAncestor)),
+                || {
+                    calls.set(calls.get() + 1);
+                    2
+                },
+                2,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.witness.failure_code,
+                Some(KeyboardWitnessFailureCode::NativeFocusChanged)
+            ));
+            assert_eq!(
+                error.witness.native_foreground_stable,
+                Some(field != 4 && field != 5)
+            );
+            assert_eq!(error.witness.native_focus_stable, Some(false));
+            assert_not_inserted(error, &calls);
+        }
     }
     #[test]
     fn provider_teardown_finishes_before_final_native_gate() {

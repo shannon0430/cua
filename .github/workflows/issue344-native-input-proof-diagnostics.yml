@@ -75,6 +75,9 @@ jobs:
               '.github/workflows/e2e-rust-windows.yml',
               'libs/cua-driver/rust/Cargo.lock',
           ]
+          # Independent fixed postimages; workflow bytes bind to their exact Git blob, not to a self-referential digest.
+          pinned_sha256={".github/workflows/e2e-rust-windows.yml": "24ecf598714b12e015a2806cb034db19d32bf7030640ee6243023837583f2c49", "libs/cua-driver/docs/foreground-target-ownership.md": "d1a05431b453f4cc4d8824de73934d031b34b5f66100640a1e02c79605cd2af9", "libs/cua-driver/rust/Cargo.lock": "fe2ece2843bd07ebdcdab67a44b34c89868a4c6e96fd326c80fd3b9aa0ba9a39", "libs/cua-driver/rust/crates/cua-driver/Cargo.toml": "0c9e0dfdb2acd8e73e052c68c7e99c376fc7aae1081670b1715030f4e5d143cd", "libs/cua-driver/rust/crates/cua-driver/tests/cross_platform_behavior_test.rs": "f55d482d61e5fc8da5909f96f273d89605e54d8c3b36c529cffa677836c07857", "libs/cua-driver/rust/crates/platform-windows/Cargo.toml": "4e66328c1468a542d90940a91668d957a738c21414134dfd213c22d98e05094a", "libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs": "f90ed1dad84cd33f9f913b5d75c2bc2faa32a019de1e946525561e4c957f5121", "libs/cua-driver/rust/crates/platform-windows/src/input/mod.rs": "a8440a003d52adbd5f15a88b04ac4bb34401ef838466ae6007115ee61b927246", "libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs": "b55e76aeb1613f1c47b46bbb548be5be8fc5f9d2e8e624012a793ec826535ba5", "libs/cua-driver/rust/crates/platform-windows/src/input/proof_diagnostics.rs": "10732ae01db247db79d2b3a83cc52687e0e8013014bd70ab93af0d46e081908d", "libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs": "f73d5e3fd816b26d637e1970c662f3375a8d399a210e159735e3ffb898613d44", "scripts/ci/windows/run-rust-e2e.ps1": "e77dd5937b63176f4705b8a0b8ddefd2a814227eff6a299b2adfd24d49b7d795"}
+          assert len(pinned_sha256)==12
           rows=[]
           for path in paths+preserved:
               blob=subprocess.check_output(['git','show',source+':'+path])
@@ -85,6 +88,7 @@ jobs:
               p.write_bytes(blob) # Explicit binary rematerialization: no PowerShell CRLF conversion.
               actual=p.read_bytes()
               assert actual==blob and b'\r\n' not in actual, 'Exact LF source blob required'
+              if path in pinned_sha256: assert hashlib.sha256(actual).hexdigest()==pinned_sha256[path], 'Fixed reviewed source postimage required'
               oid=subprocess.check_output(['git','rev-parse',source+':'+path],text=True).strip()
               rows.append({'path':path,'sha256':hashlib.sha256(actual).hexdigest(),'bytes':len(actual),'gitBlobOid':oid,'priorCheckoutMatchedBlob':prior_matches,'rematerializedFromExactGitBlob':True,'runtimeContractUnchanged':path in preserved})
           subprocess.check_call(['git','diff','--check',base,'HEAD'])
@@ -159,7 +163,14 @@ jobs:
           $testOutput | Write-Host
           $out = Join-Path $env:RUNNER_TEMP 'issue344-native-proof-diagnostics'
           $testText | Set-Content -Encoding utf8 (Join-Path $out 'native-encoder-tests.log')
-          if ($testExit -ne 0 -or $testText -notmatch 'test result: ok\. 8 passed; 0 failed; 0 ignored;') { throw 'Exactly eight bounded encoder tests required' }
+          if ($testExit -ne 0 -or $testText -notmatch 'test result: ok\. 12 passed; 0 failed; 0 ignored;') { throw 'Exactly twelve bounded encoder tests required, preserving the original eight' }
+          $lateTest = 'input::keyboard::keyboard_focus_witness_tests::late_tuple_each_field_drift_refuses_with_zero_sender_calls'
+          $lateOutput = @(& cargo +1.97.1 test --locked -p platform-windows --features native-input-proof-diagnostics --lib $lateTest -- --exact --test-threads=1 2>&1)
+          $lateExit = $LASTEXITCODE
+          $lateText = ($lateOutput | ForEach-Object { $_.ToString() }) -join "`n"
+          $lateOutput | Write-Host
+          $lateText | Set-Content -Encoding utf8 (Join-Path $out 'late-tuple-dispatch-tests.log')
+          if ($lateExit -ne 0 -or $lateText -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Late tuple drift must refuse in the production seam without sender calls' }
           & cargo +1.97.1 build --locked --release -p cua-driver --features native-input-proof-diagnostics
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic CLI build failed' }
       - name: Build existing synthetic owning fixtures
@@ -213,19 +224,183 @@ jobs:
           import copy, json, os, pathlib
           expected={'windows-electron-scroll-px-foreground','windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground','windows-tauri-scroll-px-foreground'}
           expected_ops={cell:('retained_key' if cell in {'windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground'} else 'virtual_wheel') for cell in expected}
-          allowed_keys=set('schema operation phase inputAttempted gate predicates aliases target root foreground active focus hover ownNative providerAnchor anchorParent scope virtualDocument windowless nonRootNativeAnchor providerPidPositive providerProcessClass anchorProcessClass anchorThreadClass additionalObservation matchesGateSnapshot traversalBoundary cursorMatchesGate status unavailable nodeBound depthBound cycle byteBound nodes alias parent processClass threadClass readable withinAdmittedRoot anchorIdentityMatches hoverWithinAnchor focusWithinAnchor'.split())
-          allowed_strings={'cua-native-input-proof-diagnostic/v1','retained_key','virtual_wheel','after_refusal','admittedRoot','complete','incomplete'}
-          def normal_form(value, depth=0):
+          allowed_keys=set('schema operation phase inputAttempted gate predicates aliases target root foreground active focus hover ownNative providerAnchor anchorParent scope virtualDocument windowless nonRootNativeAnchor providerPidPositive providerProcessClass anchorProcessClass anchorThreadClass additionalObservation matchesGateSnapshot traversalBoundary cursorMatchesGate status unavailable nodeBound depthBound cycle byteBound nodes alias parent processClass threadClass readable withinAdmittedRoot anchorIdentityMatches hoverWithinAnchor focusWithinAnchor refusalStage nativeSnapshotEquality targetThread targetPid foregroundThread focusThread focusPid nativeCorrelationAdmitted'.split())
+          allowed_strings={'cua-native-input-proof-diagnostic/v1','retained_key','virtual_wheel','after_refusal','admittedRoot','complete','incomplete','cua-native-input-proof-diagnostic/v2','pre_uia_vs_final_native'}
+          late_keys=set('refusalStage nativeSnapshotEquality targetThread targetPid foregroundThread focusThread focusPid nativeCorrelationAdmitted'.split())
+          def closed_object(pairs):
+              assert len(pairs)==len({key for key,_ in pairs}), 'Duplicate JSON key'
+              return dict(pairs)
+          def closed_json(value): return json.loads(value,object_pairs_hook=closed_object)
+          def normal_form(value, depth=0, late=False):
               assert depth <= 8
               if isinstance(value,dict):
-                  assert len(value)<=32 and set(value).issubset(allowed_keys)
-                  for v in value.values(): normal_form(v,depth+1)
+                  assert len(value)<=32 and set(value).issubset(allowed_keys if late else allowed_keys-late_keys)
+                  for v in value.values(): normal_form(v,depth+1,late)
               elif isinstance(value,list):
                   assert len(value)<=64
-                  for v in value: normal_form(v,depth+1)
+                  for v in value: normal_form(v,depth+1,late)
               elif value is None or isinstance(value,bool): pass
               elif isinstance(value,int): assert 0<=value<128
               else: assert isinstance(value,str) and value in allowed_strings
+
+
+          equality_keys={'target','targetThread','targetPid','root','foreground','foregroundThread','active','focus','focusThread','focusPid'}
+          wire_keys=set('version nativeElementAdmitted elementReferenceKind uiaHasKeyboardFocus uiaFocusedElementEqualsTarget uiaProcessMatchesTarget nativeForegroundRelation nativeForegroundStable nativeGuiInfoAvailable nativeActiveWithinBoundary nativeFocusWithinBoundary nativeFocusStable nativeElementCorrelation inputAttempted insertedEventCount valueChangedOnFocus providerFailureCode failureCode'.split())
+          def object_keys(value, keys):
+              assert type(value) is dict and set(value)==set(keys)
+          def alias(value, count=64):
+              assert value is None or (type(value) is int and 0<=value<count)
+          def validate_graph(gate, observation):
+              # These references index the actual bounded node array, not a hypothetical
+              # 64-slot graph. Validate incomplete graphs too, without promoting them.
+              gate_keys=['target','root','foreground','active','focus','hover','ownNative','providerAnchor','anchorParent']
+              post_keys=['foreground','active','focus','hover']
+              object_keys(gate['aliases'],gate_keys)
+              scope=gate['scope']
+              object_keys(scope,{'virtualDocument','windowless','nonRootNativeAnchor','providerPidPositive','providerProcessClass','anchorProcessClass','anchorThreadClass'})
+              for key,value in scope.items():
+                  if key.endswith('Class'): assert type(value) is int and 0<=value<128
+                  else: assert type(value) is bool
+              object_keys(observation,{'matchesGateSnapshot','traversalBoundary','cursorMatchesGate','status','unavailable','nodeBound','depthBound','cycle','aliases','nodes'})
+              assert observation['traversalBoundary']=='admittedRoot'
+              assert observation['cursorMatchesGate'] is None or type(observation['cursorMatchesGate']) is bool
+              for key in ['matchesGateSnapshot','unavailable','nodeBound','depthBound','cycle']: assert type(observation[key]) is bool
+              assert observation['status'] in {'complete','incomplete'}
+              object_keys(observation['aliases'],post_keys)
+              nodes=observation['nodes']; assert type(nodes) is list and len(nodes)<=64
+              count=len(nodes)
+              for value in list(gate['aliases'].values())+list(observation['aliases'].values()): alias(value,count)
+              root=gate['aliases']['root']
+              # Classes are interned by the encoder: provider then anchor process,
+              # anchor thread, then each node in order. A class outside that sequence
+              # cannot be an anonymous equality class emitted by this encoder.
+              assert scope['providerProcessClass']==0 and scope['anchorProcessClass'] in {0,1} and scope['anchorThreadClass']==0
+              processes=list(dict.fromkeys([scope['providerProcessClass'],scope['anchorProcessClass']]))
+              threads=[scope['anchorThreadClass']]
+              for index,node in enumerate(nodes):
+                  object_keys(node,{'alias','parent','root','processClass','threadClass','readable','withinAdmittedRoot'})
+                  assert type(node['alias']) is int and node['alias']==index
+                  for key in ['parent','root']: alias(node[key],count)
+                  for key,classes in [('processClass',processes),('threadClass',threads)]:
+                      value=node[key]; assert type(value) is int and 0<=value<128
+                      if value not in classes:
+                          assert value==len(classes); classes.append(value)
+                  for key in ['readable','withinAdmittedRoot']: assert type(node[key]) is bool
+                  if node['withinAdmittedRoot']:
+                      assert node['root']==root
+                      if index==root: assert node['parent'] is None
+                  else:
+                      assert node['root'] is None and node['parent'] is None
+              # Node aliases follow first-intern order: gate handles, later sample,
+              # then each observed parent/root. No unreferenced or relabelled slots.
+              seen=[]
+              references=[gate['aliases'][key] for key in gate_keys]+[observation['aliases'][key] for key in post_keys]
+              references.extend(value for node in nodes for value in [node['parent'],node['root']])
+              for value in references:
+                  if value is not None and value not in seen:
+                      assert value==len(seen); seen.append(value)
+              assert len(seen)==count
+              cycle=False; depth_bound=False
+              for start in range(count):
+                  visited=set(); current=start
+                  for _ in range(64):
+                      if current is None: break
+                      if current in visited:
+                          cycle=True; current=None; break
+                      visited.add(current); current=nodes[current]['parent']
+                  if current is not None: depth_bound=True
+              assert observation['cycle'] is cycle and observation['depthBound'] is depth_bound
+              if observation['nodeBound']: assert count==64
+              all_readable=all(node['readable'] and node['withinAdmittedRoot'] for node in nodes)
+              assert observation['unavailable'] or all_readable
+              flags=['unavailable','nodeBound','depthBound','cycle']
+              complete=not any(observation[key] for key in flags)
+              assert (observation['status']=='complete') is complete
+              assert scope['windowless'] is (gate['aliases']['ownNative'] is None)
+              if complete:
+                  assert count>0 and all_readable
+                  for key in ['target','root','foreground','focus','providerAnchor']: assert gate['aliases'][key] is not None
+                  # A complete rooted graph has one admitted root and every parent
+                  # chain terminates there. Null roots, self-cycles and disconnected
+                  # non-root nodes cannot claim completeness, regardless of flags.
+                  assert nodes[root]['root']==root and nodes[root]['parent'] is None
+                  for start in range(count):
+                      visited=set(); current=start
+                      while current!=root:
+                          assert current is not None and current not in visited
+                          visited.add(current); current=nodes[current]['parent']
+              if observation['matchesGateSnapshot']:
+                  assert not (observation['unavailable'] and all_readable)
+                  for key in ['foreground','focus','hover']:
+                      assert observation['aliases'][key]==gate['aliases'][key]
+                  if gate['aliases']['active'] is not None:
+                      assert observation['aliases']['active']==gate['aliases']['active']
+                  anchor=gate['aliases']['providerAnchor']; focus=gate['aliases']['focus']
+                  assert anchor is not None and focus is not None
+                  anchor_node=nodes[anchor]; focus_node=nodes[focus]
+                  assert anchor_node['readable'] and anchor_node['withinAdmittedRoot']
+                  assert focus_node['readable'] and focus_node['withinAdmittedRoot']
+                  assert anchor_node['parent']==gate['aliases']['anchorParent']
+                  assert anchor_node['processClass']==scope['anchorProcessClass'] and anchor_node['threadClass']==scope['anchorThreadClass']
+                  assert scope['nonRootNativeAnchor'] is (anchor!=root)
+              return complete
+
+          def validate_record(item):
+              late=item.get('schema')=='cua-native-input-proof-diagnostic/v2'
+              keys={'schema','operation','phase','inputAttempted','gate','additionalObservation'}
+              object_keys(item,keys|({'refusalStage'} if late else set()))
+              assert item['schema']==('cua-native-input-proof-diagnostic/v2' if late else 'cua-native-input-proof-diagnostic/v1')
+              assert item['operation'] in {'retained_key','virtual_wheel'}
+              assert item['phase']=='after_refusal' and item['inputAttempted'] is False
+              gate=item['gate']; observation=item['additionalObservation']
+              minimal={'predicates'}|({'nativeSnapshotEquality'} if late else set())
+              assert type(gate) is dict and set(gate) in (minimal,minimal|{'aliases','scope'})
+              predicate_keys={'anchorIdentityMatches','focusWithinAnchor'}
+              if item['operation']=='virtual_wheel': predicate_keys.add('hoverWithinAnchor')
+              if late:
+                  assert item['operation']=='retained_key' and item['refusalStage']=='pre_uia_vs_final_native'
+                  predicate_keys={'anchorIdentityMatches','nativeCorrelationAdmitted'}
+                  equality=gate['nativeSnapshotEquality']; object_keys(equality,equality_keys)
+                  assert all(type(value) is bool for value in equality.values()) and not all(equality.values())
+              object_keys(gate['predicates'],predicate_keys)
+              assert all(type(value) is bool for value in gate['predicates'].values())
+              if late: assert all(gate['predicates'].values())
+              if set(gate)==minimal:
+                  object_keys(observation,{'status','byteBound'})
+                  assert observation['status']=='incomplete' and observation['byteBound'] is True
+                  return False
+              complete=validate_graph(gate,observation)
+              if late: assert observation['cursorMatchesGate'] is None
+              return complete
+
+          def validate_late(item):
+              assert item.get('schema')=='cua-native-input-proof-diagnostic/v2'
+              return validate_record(item)
+
+          def relation_ready(record):
+              # Never trust the status/flags of an unvalidated record, including a
+              # direct caller outside collect. Readiness is not input authorization.
+              try:
+                  return validate_record(record) and record['additionalObservation']['matchesGateSnapshot'] is True
+              except (AssertionError,KeyError,TypeError,ValueError,AttributeError):
+                  return False
+
+          def bind_late_wire(record,result):
+              # The owning original failed Enter message is already a string in results.
+              # Decode only its fixed witness; never retain its text or provider contents.
+              marker='CUA_KEYBOARD_FOCUS_WITNESS_V1 '
+              message=result.get('message','')
+              assert isinstance(message,str)
+              if marker not in message: return False
+              assert message.count(marker)==1
+              wire,_=json.JSONDecoder(object_pairs_hook=closed_object).raw_decode(message.split(marker,1)[1].lstrip())
+              assert set(wire)==wire_keys and wire['version']==1
+              assert wire['failureCode']=='native_focus_changed' and wire['inputAttempted'] is False and type(wire['insertedEventCount']) is int and wire['insertedEventCount']==0
+              equality=record['gate']['nativeSnapshotEquality']
+              assert type(wire['nativeForegroundStable']) is bool and type(wire['nativeFocusStable']) is bool
+              assert wire['nativeForegroundStable']==(equality['foreground'] and equality['foregroundThread'])
+              assert wire['nativeFocusStable']==all(equality.values()) and wire['nativeFocusStable'] is False
+              return True
 
           def collect(log_text, results, cases, environments, scope, source):
               assert scope['sourceCommit']==source and scope['scope']=='diagnostic_four_owned_cases_only'
@@ -242,11 +417,11 @@ jobs:
               assert (scope['matrixExitCode']==0) == (not failed)
               rows=[]; current=None; begun=[]; ended=[]
               for line in log_text.splitlines():
-                  for marker in ['CUA_NATIVE_INPUT_PROOF_CASE_V1 ', 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 ']:
+                  for marker in ['CUA_NATIVE_INPUT_PROOF_CASE_V1 ', 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 ', 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 ']:
                       if marker not in line: continue
                       value=line.split(marker,1)[1]
                       assert len((marker+value+'\n').encode()) <= 16384
-                      item=json.loads(value)
+                      item=closed_json(value)
                       if marker.startswith('CUA_NATIVE_INPUT_PROOF_CASE'):
                           assert set(item)=={'cellId','phase'} and item['cellId'] in expected
                           if item['phase']=='begin':
@@ -255,12 +430,20 @@ jobs:
                               assert item['phase']=='end' and item['cellId']==current
                               ended.append(current); current=None
                       else:
-                          assert current in expected and item['schema']=='cua-native-input-proof-diagnostic/v1'
-                          normal_form(item)
+                          assert current in expected
+                          if marker=='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 ':
+                              validate_late(item)
+                          else:
+                              assert item['schema']=='cua-native-input-proof-diagnostic/v1'
+                              validate_record(item)
+                          normal_form(item,late=marker=='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 ')
                           assert item['phase']=='after_refusal' and item['inputAttempted'] is False
                           assert item['operation']==expected_ops[current]
                           assert len(item['additionalObservation'].get('nodes',[])) <= 64
                           row={'cellId':current,'sourceCommit':source,'record':item}
+                          if item['schema']=='cua-native-input-proof-diagnostic/v2':
+                              result=next(r for r in results if r['cell_id']==current)
+                              row['wireBindingAvailable']=bind_late_wire(item,result)
                           assert len((json.dumps(row,separators=(',',':'))+'\n').encode()) <= 16384
                           rows.append(row)
               assert current is None and len(begun)==4 and set(begun)==expected and begun==ended
@@ -268,6 +451,21 @@ jobs:
               # one bound refusal; zero records never turns failure or missing effects into success.
               assert len(rows)==len(failed) and {r['cellId'] for r in rows}==failed
               return rows, not failed
+
+          def encoder_fixture(operation='retained_key',late=False):
+              # Exact anonymous synthetic key encoder fixture, with wheel/late
+              # predicates matching that same encoder's actual emitted fixtures.
+              item=closed_json('{"schema":"cua-native-input-proof-diagnostic/v1","operation":"retained_key","phase":"after_refusal","inputAttempted":false,"gate":{"predicates":{"anchorIdentityMatches":true,"focusWithinAnchor":false},"aliases":{"target":0,"root":0,"foreground":0,"active":0,"focus":1,"hover":2,"ownNative":null,"providerAnchor":3,"anchorParent":0},"scope":{"virtualDocument":true,"windowless":true,"nonRootNativeAnchor":true,"providerPidPositive":true,"providerProcessClass":0,"anchorProcessClass":1,"anchorThreadClass":0}},"additionalObservation":{"matchesGateSnapshot":true,"traversalBoundary":"admittedRoot","cursorMatchesGate":null,"status":"complete","unavailable":false,"nodeBound":false,"depthBound":false,"cycle":false,"aliases":{"foreground":0,"active":0,"focus":1,"hover":2},"nodes":[{"alias":0,"parent":null,"root":0,"processClass":2,"threadClass":1,"readable":true,"withinAdmittedRoot":true},{"alias":1,"parent":3,"root":0,"processClass":1,"threadClass":0,"readable":true,"withinAdmittedRoot":true},{"alias":2,"parent":3,"root":0,"processClass":1,"threadClass":0,"readable":true,"withinAdmittedRoot":true},{"alias":3,"parent":0,"root":0,"processClass":1,"threadClass":0,"readable":true,"withinAdmittedRoot":true}]}}')
+              if operation=='virtual_wheel':
+                  item['operation']=operation
+                  item['gate']['predicates']={'anchorIdentityMatches':True,'hoverWithinAnchor':True,'focusWithinAnchor':False}
+              if late:
+                  item['schema']='cua-native-input-proof-diagnostic/v2'
+                  item['refusalStage']='pre_uia_vs_final_native'
+                  item['gate']['predicates']={'anchorIdentityMatches':True,'nativeCorrelationAdmitted':True}
+                  item['gate']['nativeSnapshotEquality']={key:True for key in equality_keys}
+                  item['gate']['nativeSnapshotEquality']['active']=False
+              return item
 
           def run_collector_regressions():
               source='collector-source-selftest'
@@ -278,7 +476,7 @@ jobs:
                       results.append(dict(cases[-1],test_status='fail' if cell in failed else 'pass',observed_behavior='error' if cell in failed else 'delivered',passed_oracles=[] if cell in failed else ['fixture_state']))
                       lines.append('CUA_NATIVE_INPUT_PROOF_CASE_V1 '+json.dumps({'cellId':cell,'phase':'begin'}))
                       if cell in failed:
-                          record={'schema':'cua-native-input-proof-diagnostic/v1','operation':expected_ops[cell],'phase':'after_refusal','inputAttempted':False,'additionalObservation':{'status':'complete','matchesGateSnapshot':True,'nodes':[]}}
+                          record=encoder_fixture(expected_ops[cell])
                           lines.append('CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '+json.dumps(record))
                       lines.append('CUA_NATIVE_INPUT_PROOF_CASE_V1 '+json.dumps({'cellId':cell,'phase':'end'}))
                   environment=[{'source_sha':source,'status':'ready','platform':'windows','display_server':'win32'}]
@@ -309,6 +507,118 @@ jobs:
                   except (AssertionError,KeyError,TypeError,ValueError): names.append(name)
                   else: raise AssertionError('Collector regression accepted invalid '+name)
               assert len(names)==13
+              names.extend(run_late_collector_regressions(fixture))
+              names.extend(run_graph_collector_regressions(fixture))
+              assert len(names)==87
+              return names
+
+
+          def run_late_collector_regressions(fixture):
+              cell='windows-tauri-type-submit-ax-foreground'; marker='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 '
+              record=encoder_fixture(late=True); equality=record['gate']['nativeSnapshotEquality']
+              def args_for(item=record):
+                  args=fixture({cell}); lines=args[0].splitlines()
+                  index=next(i for i,l in enumerate(lines) if l.startswith('CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '))
+                  lines[index]=marker+json.dumps(item); args[0]='\n'.join(lines)
+                  return args,index
+              def wire_message(foreground=True,focus=False):
+                  wire={k:None for k in wire_keys}; wire.update(version=1,nativeForegroundStable=foreground,nativeFocusStable=focus,inputAttempted=False,insertedEventCount=0,failureCode='native_focus_changed')
+                  return 'fixed refusal\nCUA_KEYBOARD_FOCUS_WITNESS_V1 '+json.dumps(wire)
+              names=[]
+              args,_=args_for(); rows,passed=collect(*args); assert len(rows)==1 and not passed and relation_ready(rows[0]['record']); names.append('late_complete_vector_and_graph')
+              args,_=args_for(); next(r for r in args[1] if r['cell_id']==cell)['message']=wire_message()
+              rows,_=collect(*args); assert rows[0]['wireBindingAvailable'] is True; names.append('late_failed_enter_wire_consistent')
+              item=copy.deepcopy(record); item['additionalObservation']['unavailable']=True; item['additionalObservation']['status']='incomplete'; item['additionalObservation']['matchesGateSnapshot']=False
+              args,_=args_for(item); rows,_=collect(*args); assert not relation_ready(rows[0]['record']) and rows[0]['record']['gate']['nativeSnapshotEquality']==equality; names.append('late_incomplete_graph_preserves_vector_not_ready')
+              item=copy.deepcopy(record); item['additionalObservation']['matchesGateSnapshot']=False
+              args,_=args_for(item); rows,_=collect(*args); assert not relation_ready(rows[0]['record']); names.append('late_post_graph_drift_not_ready')
+              item=copy.deepcopy(record); item['gate']={k:item['gate'][k] for k in ['predicates','nativeSnapshotEquality']}; item['additionalObservation']={'status':'incomplete','byteBound':True}
+              args,_=args_for(item); rows,_=collect(*args); assert not relation_ready(rows[0]['record']); names.append('late_byte_bound_preserves_vector_not_ready')
+              invalid=['late_missing_field','late_extra_field','late_integer_field','late_null_field','late_all_true','late_wrong_stage','late_raw_identity','late_wrong_operation','late_wrong_predicate_type','late_wrong_graph_type','late_missing_record','late_duplicate_record','late_stale_source','late_wire_foreground_mismatch','late_wire_focus_mismatch','late_duplicate_json_field','late_v1_v2_shape_pollution']
+              for name in invalid:
+                  item=copy.deepcopy(record); args,index=args_for(item)
+                  if name=='late_missing_field': del item['gate']['nativeSnapshotEquality']['focusPid']
+                  elif name=='late_extra_field': item['gate']['nativeSnapshotEquality']['extra']=True
+                  elif name=='late_integer_field': item['gate']['nativeSnapshotEquality']['focusPid']=1
+                  elif name=='late_null_field': item['gate']['nativeSnapshotEquality']['focusPid']=None
+                  elif name=='late_all_true': item['gate']['nativeSnapshotEquality']['active']=True
+                  elif name=='late_wrong_stage': item['refusalStage']='unexpected_stage'
+                  elif name=='late_raw_identity': item['gate']['rawIdentity']=999999
+                  elif name=='late_wrong_operation': item['operation']='virtual_wheel'
+                  elif name=='late_wrong_predicate_type': item['gate']['predicates']['nativeCorrelationAdmitted']=1
+                  elif name=='late_wrong_graph_type': item['additionalObservation']['matchesGateSnapshot']=1
+                  elif name=='late_missing_record':
+                      lines=args[0].splitlines(); lines.pop(index); args[0]='\n'.join(lines)
+                  elif name=='late_duplicate_record':
+                      lines=args[0].splitlines(); lines.insert(index,lines[index]); args[0]='\n'.join(lines)
+                  elif name=='late_stale_source': args[3][0]['source_sha']='stale'
+                  elif name=='late_wire_foreground_mismatch': next(r for r in args[1] if r['cell_id']==cell)['message']=wire_message(False,False)
+                  elif name=='late_wire_focus_mismatch': next(r for r in args[1] if r['cell_id']==cell)['message']=wire_message(True,True)
+                  elif name=='late_duplicate_json_field':
+                      lines=args[0].splitlines(); lines[index]=marker+json.dumps(item).replace('"active": false','"active": false, "active": true'); args[0]='\n'.join(lines)
+                  elif name=='late_v1_v2_shape_pollution':
+                      item['schema']='cua-native-input-proof-diagnostic/v1'; lines=args[0].splitlines(); lines[index]='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '+json.dumps(item); args[0]='\n'.join(lines)
+                  if name not in {'late_missing_record','late_duplicate_record','late_duplicate_json_field','late_v1_v2_shape_pollution'}:
+                      lines=args[0].splitlines(); lines[index]=marker+json.dumps(item); args[0]='\n'.join(lines)
+                  try: collect(*args)
+                  except (AssertionError,KeyError,TypeError,ValueError): names.append(name)
+                  else: raise AssertionError('Collector accepted invalid '+name)
+              assert len(names)==22
+              return names
+
+          def run_graph_collector_regressions(fixture):
+              cell='windows-tauri-type-submit-ax-foreground'; names=[]
+              def args_for(item):
+                  args=fixture({cell}); lines=args[0].splitlines()
+                  index=next(i for i,line in enumerate(lines) if line.startswith('CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '))
+                  marker='CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 ' if item['schema'].endswith('/v2') else 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 '
+                  lines[index]=marker+json.dumps(item); args[0]='\n'.join(lines)
+                  return args
+              # The six independently reproduced loopholes are rejected in both
+              # generations where meaningful, based on real encoder fixture graphs.
+              invalid=['gate_alias_outside_nodes','post_alias_outside_nodes','null_node_root','parent_self_cycle','process_class_outside_graph','integer_predicate','bool_node_alias','bool_gate_alias','bool_node_parent','bool_node_process_class','null_gate_root','null_gate_target','null_gate_focus','null_gate_anchor','nonroot_null_parent','other_root_reference','parent_long_cycle','duplicate_node_alias','extra_node_field','integer_readable','integer_scope_bool','missing_predicate','extra_predicate','wrong_class_sequence']
+              for late in [False,True]:
+                  for name in invalid:
+                      item=encoder_fixture(late=late); gate=item['gate']; observation=item['additionalObservation']; nodes=observation['nodes']
+                      if name=='gate_alias_outside_nodes': gate['aliases']['focus']=63
+                      elif name=='post_alias_outside_nodes': observation['aliases']['focus']=63
+                      elif name=='null_node_root': nodes[0]['root']=None
+                      elif name=='parent_self_cycle': nodes[1]['parent']=1
+                      elif name=='process_class_outside_graph': gate['scope']['anchorProcessClass']=127
+                      elif name=='integer_predicate': gate['predicates']['anchorIdentityMatches']=1
+                      elif name=='bool_node_alias': nodes[0]['alias']=False
+                      elif name=='bool_gate_alias': gate['aliases']['target']=False
+                      elif name=='bool_node_parent': nodes[3]['parent']=False
+                      elif name=='bool_node_process_class': nodes[0]['processClass']=True
+                      elif name=='null_gate_root': gate['aliases']['root']=None
+                      elif name=='null_gate_target': gate['aliases']['target']=None
+                      elif name=='null_gate_focus': gate['aliases']['focus']=None
+                      elif name=='null_gate_anchor': gate['aliases']['providerAnchor']=None
+                      elif name=='nonroot_null_parent': nodes[1]['parent']=None
+                      elif name=='other_root_reference': nodes[1]['root']=3
+                      elif name=='parent_long_cycle': nodes[1]['parent']=3; nodes[3]['parent']=1
+                      elif name=='duplicate_node_alias': nodes[1]['alias']=0
+                      elif name=='extra_node_field': nodes[0]['extra']=True
+                      elif name=='integer_readable': nodes[0]['readable']=1
+                      elif name=='integer_scope_bool': gate['scope']['windowless']=1
+                      elif name=='missing_predicate': del gate['predicates']['anchorIdentityMatches']
+                      elif name=='extra_predicate': gate['predicates']['hoverWithinAnchor']=False
+                      elif name=='wrong_class_sequence': nodes[0]['threadClass']=3
+                      assert not relation_ready(item), 'Unvalidated invalid graph must never be relation-ready'
+                      try: collect(*args_for(item))
+                      except (AssertionError,KeyError,TypeError,ValueError): names.append(('v2_' if late else 'v1_')+name)
+                      else: raise AssertionError('Collector accepted malformed graph '+name)
+                  # Genuine encoder-shaped bounded/incomplete and byte fallback
+                  # records are preserved, but never become complete relation evidence.
+                  item=encoder_fixture(late=late); observation=item['additionalObservation']
+                  observation.update(status='incomplete',cycle=True); observation['nodes'][1]['parent']=1
+                  rows,passed=collect(*args_for(item)); assert len(rows)==1 and not passed and not relation_ready(item)
+                  names.append(('v2_' if late else 'v1_')+'truthful_cycle_incomplete_not_ready')
+                  item=encoder_fixture(late=late); minimal={'predicates'}|({'nativeSnapshotEquality'} if late else set())
+                  item['gate']={key:item['gate'][key] for key in minimal}; item['additionalObservation']={'status':'incomplete','byteBound':True}
+                  rows,passed=collect(*args_for(item)); assert len(rows)==1 and not passed and not relation_ready(item)
+                  names.append(('v2_' if late else 'v1_')+'closed_byte_bound_not_ready')
+              assert len(names)==52
               return names
 
           regressions=run_collector_regressions()
@@ -327,7 +637,7 @@ jobs:
               error=type(exc).__name__ # no provider/log/environment values
           with (p/'native-proof-diagnostics.jsonl').open('w',encoding='utf-8') as out:
               for row in rows: out.write(json.dumps(row,separators=(',',':'))+'\n')
-          (p/'diagnostic-collection.json').write_text(json.dumps({'sourceCommit':os.environ['GITHUB_SHA'],'records':len(rows),'collectionComplete':error is None,'fourOriginalDeliverCasesAccepted':error is None and all_pass,'relationsReadyForCorrection':error is None and bool(rows) and all(r['record']['additionalObservation'].get('status')=='complete' and r['record']['additionalObservation'].get('matchesGateSnapshot') is True for r in rows),'collectorRegressionPassed':len(regressions),'collectorRegressionNames':regressions,'errorClass':error,'canonicalAllAccepted':False,'inputProofAuthorizedByDiagnostics':False},indent=2)+'\n')
+          (p/'diagnostic-collection.json').write_text(json.dumps({'sourceCommit':os.environ['GITHUB_SHA'],'records':len(rows),'collectionComplete':error is None,'fourOriginalDeliverCasesAccepted':error is None and all_pass,'relationsReadyForCorrection':error is None and bool(rows) and all(relation_ready(r['record']) for r in rows),'collectorRegressionPassed':len(regressions),'collectorRegressionNames':regressions,'errorClass':error,'canonicalAllAccepted':False,'inputProofAuthorizedByDiagnostics':False},indent=2)+'\n')
           if error: raise SystemExit('Native relation measurement incomplete; existing failure is preserved')
       - name: Run existing owning result and trajectory report without changing acceptance
         if: always()
@@ -354,6 +664,7 @@ jobs:
             ${{ runner.temp }}/issue344-native-proof-diagnostics/native-unit-tests.log
             ${{ runner.temp }}/issue344-native-proof-diagnostics/native-unit-verification.json
             ${{ runner.temp }}/issue344-native-proof-diagnostics/native-encoder-tests.log
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/late-tuple-dispatch-tests.log
             ${{ runner.temp }}/issue344-native-proof-diagnostics/scope.json
             ${{ runner.temp }}/issue344-native-proof-diagnostics/cases.jsonl
             ${{ runner.temp }}/issue344-native-proof-diagnostics/results.jsonl

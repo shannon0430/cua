@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 const MARKER: &str = "CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 ";
+const LATE_MARKER: &str = "CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V2 ";
 const MAX_NODES: usize = 64;
 const MAX_DEPTH: usize = 64;
 const MAX_BYTES: usize = 16 * 1024;
@@ -54,12 +55,70 @@ pub(super) struct Snapshot {
     pub scope: Scope,
 }
 
+// Private transient tuples: deliberately no Debug or Serialize implementation.
+#[derive(Clone, Copy)]
+pub(super) struct KeyNativeTuple {
+    pub target: u64,
+    pub target_thread: u32,
+    pub target_pid: u32,
+    pub root: u64,
+    pub foreground: u64,
+    pub foreground_thread: u32,
+    pub active: u64,
+    pub focus: u64,
+    pub focus_thread: u32,
+    pub focus_pid: u32,
+}
+#[derive(Clone, Copy)]
+struct NativeSnapshotEquality([bool; 10]);
+impl NativeSnapshotEquality {
+    fn compare(before: KeyNativeTuple, final_native: KeyNativeTuple) -> Self {
+        Self([
+            before.target == final_native.target,
+            before.target_thread == final_native.target_thread,
+            before.target_pid == final_native.target_pid,
+            before.root == final_native.root,
+            before.foreground == final_native.foreground,
+            before.foreground_thread == final_native.foreground_thread,
+            before.active == final_native.active,
+            before.focus == final_native.focus,
+            before.focus_thread == final_native.focus_thread,
+            before.focus_pid == final_native.focus_pid,
+        ])
+    }
+    fn has_drift(self) -> bool {
+        self.0.into_iter().any(|equal| !equal)
+    }
+    fn json(self) -> String {
+        let [target, target_thread, target_pid, root, foreground, foreground_thread, active, focus, focus_thread, focus_pid] =
+            self.0;
+        format!(
+            concat!(
+                "{{\"target\":{},\"targetThread\":{},\"targetPid\":{},",
+                "\"root\":{},\"foreground\":{},\"foregroundThread\":{},",
+                "\"active\":{},\"focus\":{},\"focusThread\":{},\"focusPid\":{}}}"
+            ),
+            target,
+            target_thread,
+            target_pid,
+            root,
+            foreground,
+            foreground_thread,
+            active,
+            focus,
+            focus_thread,
+            focus_pid
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Predicates {
     Key {
         anchor_identity: bool,
         focus_within_anchor: bool,
     },
+    LateKey, // read_final succeeded; no newly observed IsChild claim
     Wheel {
         anchor_identity: bool,
         hover_within_anchor: bool,
@@ -69,7 +128,7 @@ pub(super) enum Predicates {
 impl Predicates {
     fn operation(self) -> &'static str {
         match self {
-            Self::Key { .. } => "retained_key",
+            Self::Key { .. } | Self::LateKey => "retained_key",
             Self::Wheel { .. } => "virtual_wheel",
         }
     }
@@ -77,6 +136,7 @@ impl Predicates {
         match self {
             Self::Key { anchor_identity, focus_within_anchor } => format!(
                 "{{\"anchorIdentityMatches\":{anchor_identity},\"focusWithinAnchor\":{focus_within_anchor}}}"),
+            Self::LateKey => "{\"anchorIdentityMatches\":true,\"nativeCorrelationAdmitted\":true}".to_owned(),
             Self::Wheel { anchor_identity, hover_within_anchor, focus_within_anchor } => format!(
                 "{{\"anchorIdentityMatches\":{anchor_identity},\"hoverWithinAnchor\":{hover_within_anchor},\"focusWithinAnchor\":{focus_within_anchor}}}"),
         }
@@ -270,8 +330,54 @@ fn encode(
     out
 }
 
+// The ten guard equalities are complete independently of this later graph.
+// An all-equal tuple is not a late refusal, and must not invoke the observer.
+fn encode_late_refusal(
+    gate: Snapshot,
+    equality: NativeSnapshotEquality,
+    post: PostSample,
+    observe: impl FnMut(u64) -> RawNode,
+) -> Option<String> {
+    if !equality.has_drift() {
+        return None;
+    }
+    let graph = encode(gate, Predicates::LateKey, post, observe);
+    let body = graph.strip_prefix("{\"schema\":\"cua-native-input-proof-diagnostic/v1\",")?;
+    let body = body.replacen(
+        "\"gate\":{",
+        &format!("\"gate\":{{\"nativeSnapshotEquality\":{},", equality.json()),
+        1,
+    );
+    let out = format!("{{\"schema\":\"cua-native-input-proof-diagnostic/v2\",\"refusalStage\":\"pre_uia_vs_final_native\",{body}");
+    if out.len() + LATE_MARKER.len() + 1 > MAX_BYTES {
+        return Some(format!("{{\"schema\":\"cua-native-input-proof-diagnostic/v2\",\"refusalStage\":\"pre_uia_vs_final_native\",\"operation\":\"retained_key\",\"phase\":\"after_refusal\",\"inputAttempted\":false,\"gate\":{{\"nativeSnapshotEquality\":{},\"predicates\":{}}},\"additionalObservation\":{{\"status\":\"incomplete\",\"byteBound\":true}}}}", equality.json(), Predicates::LateKey.json()));
+    }
+    Some(out)
+}
+
 #[cfg(all(feature = "native-input-proof-diagnostics", target_os = "windows"))]
 pub(super) fn record_refusal(gate: Snapshot, predicates: Predicates) {
+    record_observation(gate, predicates, None);
+}
+
+#[cfg(all(feature = "native-input-proof-diagnostics", target_os = "windows"))]
+pub(super) fn record_key_tuple_refusal(
+    gate: Snapshot,
+    before: KeyNativeTuple,
+    final_native: KeyNativeTuple,
+) {
+    let equality = NativeSnapshotEquality::compare(before, final_native);
+    if equality.has_drift() {
+        record_observation(gate, Predicates::LateKey, Some(equality));
+    }
+}
+
+#[cfg(all(feature = "native-input-proof-diagnostics", target_os = "windows"))]
+fn record_observation(
+    gate: Snapshot,
+    predicates: Predicates,
+    equality: Option<NativeSnapshotEquality>,
+) {
     use std::io::Write as _;
     use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -304,7 +410,7 @@ pub(super) fn record_refusal(gate: Snapshot, predicates: Predicates) {
                 .map(|_| cursor.x == x && cursor.y == y)
         }),
     };
-    let record = encode(gate, predicates, post, |h| {
+    let observe = |h| {
         let window = HWND(h as *mut _);
         let root = unsafe { GetAncestor(window, GA_ROOT) }.0 as usize as u64;
         if root != gate.root {
@@ -330,11 +436,19 @@ pub(super) fn record_refusal(gate: Snapshot, predicates: Predicates) {
                 && thread != 0
                 && parent_readable,
         }
-    });
+    };
+    let (marker, record) = if let Some(equality) = equality {
+        let Some(record) = encode_late_refusal(gate, equality, post, observe) else {
+            return;
+        };
+        (LATE_MARKER, record)
+    } else {
+        (MARKER, encode(gate, predicates, post, observe))
+    };
     // One bounded write, after refusal. A closed stderr cannot alter the error.
     let _ = std::io::stderr()
         .lock()
-        .write_all(format!("{MARKER}{record}\n").as_bytes());
+        .write_all(format!("{marker}{record}\n").as_bytes());
 }
 
 #[cfg(test)]
@@ -547,5 +661,111 @@ mod tests {
         assert!(record.contains("\"withinAdmittedRoot\":false"));
         assert!(record.contains("\"matchesGateSnapshot\":false"));
         assert!(record.contains("\"status\":\"incomplete\""));
+    }
+    fn key_tuple() -> KeyNativeTuple {
+        let g = sample();
+        KeyNativeTuple {
+            target: g.target,
+            target_thread: g.target_thread,
+            target_pid: g.target_pid,
+            root: g.root,
+            foreground: g.foreground,
+            foreground_thread: g.root_thread,
+            active: g.active.unwrap(),
+            focus: g.focus,
+            focus_thread: g.focus_thread.unwrap(),
+            focus_pid: g.focus_pid.unwrap(),
+        }
+    }
+    fn drifted_tuple(field: usize) -> KeyNativeTuple {
+        let mut tuple = key_tuple();
+        match field {
+            0 => tuple.target += 1,
+            1 => tuple.target_thread += 1,
+            2 => tuple.target_pid += 1,
+            3 => tuple.root += 1,
+            4 => tuple.foreground += 1,
+            5 => tuple.foreground_thread += 1,
+            6 => tuple.active += 1,
+            7 => tuple.focus += 1,
+            8 => tuple.focus_thread += 1,
+            9 => tuple.focus_pid += 1,
+            _ => panic!("fixed ten-field fixture"),
+        }
+        tuple
+    }
+    #[test]
+    fn late_tuple_each_field_has_exact_ten_boolean_equalities() {
+        for field in 0..10 {
+            let equality = NativeSnapshotEquality::compare(key_tuple(), drifted_tuple(field));
+            assert!(equality.has_drift());
+            for other in 0..10 {
+                assert_eq!(equality.0[other], other != field);
+            }
+            let json = equality.json();
+            assert_eq!(json.matches(":false").count(), 1);
+            assert_eq!(json.matches(":true").count(), 9);
+        }
+    }
+    #[test]
+    fn stable_tuple_is_not_a_refusal_and_never_observes() {
+        let g = sample();
+        let equality = NativeSnapshotEquality::compare(key_tuple(), key_tuple());
+        assert_eq!(equality.0, [true; 10]);
+        assert!(encode_late_refusal(g, equality, post(g), |_| panic!(
+            "stable tuple must not observe"
+        ))
+        .is_none());
+    }
+    #[test]
+    fn late_refusal_is_bounded_anonymous_and_uses_captured_correlation() {
+        let g = sample();
+        let equality = NativeSnapshotEquality::compare(key_tuple(), drifted_tuple(6));
+        let record = encode_late_refusal(g, equality, post(g), node).unwrap();
+        assert!(record.starts_with("{\"schema\":\"cua-native-input-proof-diagnostic/v2\",\"refusalStage\":\"pre_uia_vs_final_native\","));
+        assert!(record.contains("\"nativeCorrelationAdmitted\":true"));
+        assert!(!record.contains("focusWithinAnchor"));
+        assert!(record.contains("\"inputAttempted\":false"));
+        assert!(record.contains("\"status\":\"complete\""));
+        assert!(record.len() + LATE_MARKER.len() + 1 <= MAX_BYTES);
+        for raw in [
+            g.target,
+            g.scope.anchor,
+            g.scope.parent,
+            g.focus,
+            g.target_pid as u64,
+            g.target_thread as u64,
+            g.scope.pid as u64,
+            g.scope.thread as u64,
+            g.scope.provider_pid as u64,
+        ] {
+            assert!(!record.contains(&raw.to_string()));
+        }
+        for field in [
+            "runtimeId",
+            "className",
+            "value",
+            "title",
+            "url",
+            "environment",
+        ] {
+            assert!(!record.contains(field));
+        }
+        println!("CUA_NATIVE_INPUT_ENCODER_LATE_TEST_FIXTURE_V2 {record}");
+    }
+    #[test]
+    fn late_delta_survives_incomplete_or_mismatching_post_refusal_graph() {
+        let g = sample();
+        let equality = NativeSnapshotEquality::compare(key_tuple(), drifted_tuple(9));
+        let record =
+            encode_late_refusal(g, equality, PostSample::default(), |_| RawNode::default())
+                .unwrap();
+        assert!(record.contains("\"focusPid\":false"));
+        assert!(record.contains("\"status\":\"incomplete\""));
+        let mut drift = post(g);
+        drift.active += 1;
+        let record = encode_late_refusal(g, equality, drift, node).unwrap();
+        assert!(record.contains("\"focusPid\":false"));
+        assert!(record.contains("\"matchesGateSnapshot\":false"));
     }
 }
