@@ -4366,6 +4366,27 @@ fn focus_cached_element_for_foreground(
     )
 }
 
+/// Single owner for the retained key's immutable witness text and actual key
+/// insertion count metadata. Core publication projects this same record; no
+/// preparation/focus clicks contribute to the reported delivery count.
+fn retained_keyboard_success_result(
+    witness: &crate::input::keyboard::KeyboardFocusWitness,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::WindowsSendInput,
+        RequestedDelivery::Foreground,
+    )
+    .actual_delivery(ActualDelivery::Foreground)
+    .delivered_count(witness.inserted_event_count)
+    .build()
+    .expect("unverifiable native keyboard record");
+    ToolResult::text(witness.diagnostic_text()).with_action_record(record)
+}
+
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -5405,6 +5426,61 @@ impl Tool for PressKeyTool {
                 Err(e) => return ToolResult::error(format!("UIA focus task failed: {e}")),
             }
         }
+        // Instrument only the standard retained-element foreground key.
+        // Window-only keys, background transport and other actuators retain
+        // their existing routes; no new raw diagnostic/input surface is added.
+        if !px_focus && delivery == DeliveryMode::Foreground && elem_idx.is_some() {
+            use crate::input::keyboard::{
+                send_retained_key_with_witness, KeyboardElementReferenceKind,
+            };
+            let idx = elem_idx.unwrap() as usize;
+            let point = admitted.as_ref().map(|element| element.center);
+            let reference_kind = if args.opt_str("element_token").is_some() {
+                KeyboardElementReferenceKind::Token
+            } else {
+                KeyboardElementReferenceKind::IndexSnapshot
+            };
+            let result = tokio::task::spawn_blocking({
+                let admitted = admitted.clone();
+                move || {
+                    let element = admitted
+                        .as_ref()
+                        .expect("element cache admission retains indexed element");
+                    let modifiers: Vec<&str> = mods.iter().map(String::as_str).collect();
+                    send_retained_key_with_witness(
+                        hwnd,
+                        pid,
+                        &key,
+                        &modifiers,
+                        reference_kind,
+                        element,
+                        || focus_cached_element_for_foreground(&admitted, hwnd, idx, point),
+                    )
+                }
+            })
+            .await;
+            return match result {
+                Ok(Ok(witness)) => retained_keyboard_success_result(&witness),
+                Ok(Err(failure)) => {
+                    let message = failure.to_string();
+                    if failure.witness.input_attempted {
+                        ToolResult::error(message).with_structured(json!({
+                            "code": "keyboard_input_partial", "execution_state": "unknown"
+                        }))
+                    } else {
+                        ToolResult::error(message.clone()).with_structured(json!({
+                            "status": "refused", "refusal": {
+                                "code": "keyboard_focus_unavailable", "message": message
+                            }
+                        }))
+                    }
+                }
+                // A worker failure may occur after insertion; no target/key
+                // or panic/provider message is copied, and no retry is invited.
+                Err(_) => ToolResult::error("keyboard_focus_outcome_unknown: native task did not return; observe the same target before any further input")
+                    .with_structured(json!({"code": "keyboard_focus_outcome_unknown", "execution_state": "unknown"})),
+            };
+        }
         let key_display = key.clone();
         // Foreground: send_key_synthesized takes the SetForegroundWindow path.
         // Skipped when px-focus already fronted/clicked the target — the key then
@@ -5971,73 +6047,214 @@ impl Tool for SetValueTool {
         }
 
         let result = tokio::task::spawn_blocking({
-            move || -> anyhow::Result<String> {
+            move || -> anyhow::Result<(ActionTransport, bool, &'static str)> {
                 let _noact = _noact;
                 let ptr = admitted.as_ptr();
+                use anyhow::Context;
                 use windows::core::{Interface, BSTR};
                 use windows::Win32::UI::Accessibility::{
-                    IUIAutomationElement, IUIAutomationValuePattern, UIA_ValuePatternId,
+                    IUIAutomationElement, IUIAutomationRangeValuePattern,
+                    IUIAutomationValuePattern, UIA_IsValuePatternAvailablePropertyId,
+                    UIA_RangeValuePatternId, UIA_ValuePatternId,
                 };
                 let elem = std::mem::ManuallyDrop::new(unsafe {
                     IUIAutomationElement::from_raw(ptr as *mut _)
                 });
-                // Try ValuePattern first (text inputs, editable combos, etc).
-                // The SetValue is shielded by the EnableWindow bypass: a
-                // Chromium/Electron (or XAML) SetValue handler self-foregrounds via
-                // SetForegroundWindow, which WS_EX_NOACTIVATE alone does not stop;
-                // disabling the host for the duration does, while the a11y-channel
-                // write still lands. (No-op shield for non-XAML/non-Chromium hosts.)
-                if let Ok(pattern) = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) } {
-                    if let Ok(vp) = pattern.cast::<IUIAutomationValuePattern>() {
-                        let set =
-                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                vp.SetValue(&BSTR::from(value.as_str()))
-                            });
-                        if set.is_ok() {
-                            std::mem::forget(elem);
-                            return Ok("ValuePattern".to_string());
+                if !unsafe { elem.CurrentIsEnabled() }
+                    .context("set_value: enabled state unreadable; no write was attempted")?
+                    .as_bool()
+                {
+                    anyhow::bail!("set_value: target is disabled; no write was attempted");
+                }
+                let echo_surface = crate::input::is_chromium_target_window(hwnd)
+                    || crate::input::has_chromium_descendant(hwnd);
+                let value_pattern = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) };
+                match value_pattern {
+                    Ok(pattern) => {
+                        let vp: IUIAutomationValuePattern = pattern.cast()
+                            .context("set_value: ValuePattern interface failed; no write was attempted")?;
+                        if unsafe { vp.CurrentIsReadOnly() }
+                            .context("set_value: ValuePattern read-only state unreadable; no write was attempted")?
+                            .as_bool()
+                        {
+                            anyhow::bail!("set_value: ValuePattern is read-only; no write was attempted");
                         }
+                        // Preserve an implemented provider's write HRESULT. A
+                        // write error must never fall through to a second actuator.
+                        let (verified, verify) = set_value_write_then_readback(
+                            &value, echo_surface,
+                            || crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                                vp.SetValue(&BSTR::from(value.as_str()))
+                            }).context("set_value: ValuePattern.SetValue failed; no fallback write was attempted; observe target before retrying"),
+                            || unsafe { vp.CurrentValue() }.ok().map(|readback| readback.to_string()),
+                        )?;
+                        Ok((ActionTransport::WindowsUiaValue, verified, verify))
+                    }
+                    Err(value_pattern_error) => {
+                        let unavailable = unsafe {
+                            elem.GetCurrentPropertyValue(UIA_IsValuePatternAvailablePropertyId)
+                        }.ok().and_then(|value| bool::try_from(&value).ok()) == Some(false);
+                        if !unavailable {
+                            return Err(value_pattern_error).context(
+                                "set_value: ValuePattern lookup failed while support was not proven absent; no write was attempted"
+                            );
+                        }
+                        // Pattern lookup is observational. Only when ValuePattern
+                        // is unavailable may the existing numeric range path be used.
+                        // Preserve both lookup errors instead of inventing a write failure.
+                        let pattern = unsafe { elem.GetCurrentPattern(UIA_RangeValuePatternId) }
+                            .map_err(|range_error| anyhow::anyhow!(
+                                "set_value: ValuePattern lookup failed (HRESULT 0x{:08X}); RangeValuePattern lookup failed (HRESULT 0x{:08X}); no write was attempted",
+                                value_pattern_error.code().0 as u32, range_error.code().0 as u32
+                            ))?;
+                        let rv: IUIAutomationRangeValuePattern = pattern.cast()
+                            .context("set_value: RangeValuePattern interface failed; no write was attempted")?;
+                        if unsafe { rv.CurrentIsReadOnly() }
+                            .context("set_value: RangeValuePattern read-only state unreadable; no write was attempted")?
+                            .as_bool()
+                        {
+                            anyhow::bail!("set_value: RangeValuePattern is read-only; no write was attempted");
+                        }
+                        let parsed: f64 = value.parse().map_err(|_| anyhow::anyhow!(
+                            "set_value: RangeValuePattern requires a finite numeric value; no write was attempted"
+                        ))?;
+                        if !parsed.is_finite() {
+                            anyhow::bail!("set_value: RangeValuePattern requires a finite numeric value; no write was attempted");
+                        }
+                        let (verified, verify) = set_value_write_then_readback(
+                            &parsed, echo_surface,
+                            || crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                                rv.SetValue(parsed)
+                            }).context("set_value: RangeValuePattern.SetValue failed; observe target before retrying"),
+                            || unsafe { rv.CurrentValue() }.ok(),
+                        )?;
+                        Ok((ActionTransport::WindowsUiaRangeValue, verified, verify))
                     }
                 }
-                // Fall through to RangeValuePattern for Sliders / ProgressBars /
-                // numeric ranges. RangeValue.SetValue takes a double, so coerce
-                // the string. Documented gap-closer (PR #1699 harness exposed).
-                use windows::Win32::UI::Accessibility::{
-                    IUIAutomationRangeValuePattern, UIA_RangeValuePatternId,
-                };
-                if let Ok(pattern) = unsafe { elem.GetCurrentPattern(UIA_RangeValuePatternId) } {
-                    if let Ok(rv) = pattern.cast::<IUIAutomationRangeValuePattern>() {
-                        let parsed: f64 = value.parse().map_err(|_| {
-                            anyhow::anyhow!(
-                                "set_value: target element exposes RangeValuePattern (Slider / \
-                         ProgressBar / numeric range). `value` must be a parseable f64; \
-                         got {value:?}."
-                            )
-                        })?;
-                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                            rv.SetValue(parsed)
-                        })?;
-                        std::mem::forget(elem);
-                        return Ok("RangeValuePattern".to_string());
-                    }
-                }
-                std::mem::forget(elem);
-                anyhow::bail!(
-                    "set_value: element [{idx}] does not implement ValuePattern or \
-                 RangeValuePattern. For controls with TogglePattern (CheckBox) or \
-                 SelectionItemPattern (RadioButton / ComboBoxItem), use the `click` \
-                 tool instead."
-                );
             }
         })
         .await;
         match result {
-            Ok(Ok(pattern_name)) => {
-                ToolResult::text(format!("✅ Set AXValue on [{idx}] (UIA {pattern_name})."))
+            Ok(Ok((transport, verified, verify))) => {
+                use cua_driver_core::action_record::{
+                    ActionEffect, ActionEvidence, ActionExecutionRecord, ActualDelivery,
+                    EvidenceKind, RequestedDelivery,
+                };
+                let effect = if verified {
+                    ActionEffect::Confirmed
+                } else {
+                    ActionEffect::Unverifiable
+                };
+                let mut record =
+                    ActionExecutionRecord::new(effect, transport, RequestedDelivery::Background);
+                // No foreground readback was performed. Do not upgrade the
+                // historical unknown delivery merely because an API acknowledged.
+                record.actual_delivery = Some(ActualDelivery::Unknown);
+                if verified {
+                    record.evidence.push(ActionEvidence {
+                        kind: EvidenceKind::ValueReadback,
+                        detail: "Fresh native pattern value equals the requested value on the exact retained element".into(),
+                    });
+                }
+                let message = if verified {
+                    format!("Requested value matches native readback on element [{idx}].")
+                } else {
+                    format!("UIA accepted set_value on element [{idx}] (readback: {verify}); application effect is unverified. Take a fresh observation before any retry; no fallback input was sent.")
+                };
+                ToolResult::text(message)
+                    .with_structured(json!({
+                        "verified": verified,
+                        "verify": verify,
+                        "effect": if verified { "confirmed" } else { "unverifiable" }
+                    }))
+                    .with_action_record(record)
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
+            Ok(Err(e)) => {
+                // Native providers can attach arbitrary IErrorInfo text. Keep
+                // the original HRESULT, never log provider value/title strings.
+                let message = if let Some(native) = e.downcast_ref::<windows::core::Error>() {
+                    format!("set_value: native provider operation failed (HRESULT 0x{:08X}); no fallback write was attempted; inspect exact target before retrying", native.code().0 as u32)
+                } else {
+                    format!("{e:#}")
+                };
+                ToolResult::error(message)
+            }
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+/// Testable production write/readback boundary. A failed write never triggers
+/// readback or another actuator; unreadable/mismatched values remain pending.
+fn set_value_write_then_readback<T: PartialEq>(
+    expected: &T,
+    echo_surface: bool,
+    write: impl FnOnce() -> anyhow::Result<()>,
+    read: impl FnOnce() -> Option<T>,
+) -> anyhow::Result<(bool, &'static str)> {
+    write()?;
+    let matches = read().is_some_and(|actual| &actual == expected);
+    Ok(if matches && !echo_surface {
+        (true, "matched")
+    } else if matches {
+        (false, "echo_untrusted")
+    } else {
+        (false, "pending")
+    })
+}
+
+#[cfg(test)]
+mod set_value_native_readback_tests {
+    use super::set_value_write_then_readback;
+    use anyhow::anyhow;
+    use std::cell::Cell;
+
+    #[test]
+    fn native_write_error_is_preserved_and_readback_is_not_called() {
+        let reads = Cell::new(0);
+        let result = set_value_write_then_readback(
+            &"requested",
+            false,
+            || Err(anyhow!("HRESULT 0x80040201")),
+            || {
+                reads.set(reads.get() + 1);
+                Some("requested")
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "HRESULT 0x80040201");
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
+    fn requested_state_readback_confirms_including_idempotent_state() {
+        assert_eq!(
+            set_value_write_then_readback(&"requested", false, || Ok(()), || Some("requested"))
+                .unwrap(),
+            (true, "matched")
+        );
+        assert_eq!(
+            set_value_write_then_readback(&1.5_f64, false, || Ok(()), || Some(1.5)).unwrap(),
+            (true, "matched")
+        );
+    }
+
+    #[test]
+    fn unchanged_mismatched_or_missing_readback_remains_pending() {
+        for actual in [Some("old"), Some("unexpected"), None] {
+            assert_eq!(
+                set_value_write_then_readback(&"requested", false, || Ok(()), || actual).unwrap(),
+                (false, "pending")
+            );
+        }
+    }
+
+    #[test]
+    fn chromium_echo_does_not_prove_application_state() {
+        assert_eq!(
+            set_value_write_then_readback(&"requested", true, || Ok(()), || Some("requested"))
+                .unwrap(),
+            (false, "echo_untrusted")
+        );
     }
 }
 
@@ -6311,10 +6528,9 @@ impl Tool for ScrollTool {
             );
         }
         // delivery_mode:"foreground" — SendInput MOUSEEVENTF_WHEEL at the target
-        // window's screen center (send_wheel_synthesized). The wheel routes to
-        // the window under the cursor — queue-origin input Chromium/GTK accept —
-        // so it lands where PostMessage WM_*SCROLL is dropped. Mirrors the
-        // desktop-scope wheel branch above; `by` (line/page) folds into the tick
+        // window-scoped target. Reuse confirmed foreground and require hovered
+        // scroll-container/focus agreement before dispatch; insertion alone does
+        // not prove consumption. `by` (line/page) folds into the tick
         // count (page ≈ 3 detents).
         if delivery == DeliveryMode::Foreground {
             let (horizontal, sign) = match direction.as_str() {
@@ -6332,7 +6548,7 @@ impl Tool for ScrollTool {
             let ticks = sign * (amount as i32) * per;
             // A supplied PX target is window-local in the get_window_state
             // bitmap. Route the wheel there so nested web scrollers receive it;
-            // otherwise retain the whole-window center fallback.
+            // otherwise prefer the admitted element center before the window center.
             let px = args.get("x").and_then(|value| value.as_f64());
             let py = args.get("y").and_then(|value| value.as_f64());
             if px.is_some() != py.is_some() {
@@ -6340,6 +6556,8 @@ impl Tool for ScrollTool {
             }
             let center = if let (Some(x), Some(y)) = (px, py) {
                 Some(bitmap_to_screen(hwnd, x as i32, y as i32))
+            } else if let Some(element) = admitted.as_ref() {
+                Some(element.center)
             } else {
                 tokio::task::spawn_blocking({
                     let admitted = admitted.clone();
@@ -6371,17 +6589,43 @@ impl Tool for ScrollTool {
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
-                    crate::input::send_wheel_synthesized(cx, cy, ticks, horizontal)
+                    crate::input::mouse::send_wheel_synthesized_to_window(
+                        hwnd, pid, cx, cy, ticks, horizontal,
+                    )
                 }
             })
             .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
-                    "✅ Scrolled {dir_disp} via SendInput wheel ({tick_disp} tick(s)) at \
-                     screen ({cx},{cy}) (delivery_mode:foreground)."
+                    "Inserted {dir_disp} wheel input ({tick_disp} tick(s)) at screen ({cx},{cy}) \
+                     after exact target/focus checks (delivery_mode:foreground); view movement is unverified."
+                )).with_structured(json!({
+                    "path": "SendInput",
+                    "delivery_mode": "foreground",
+                    "verified": false,
+                    "effect": "unverifiable"
+                })),
+                Ok(Err(e)) if e.downcast_ref::<crate::input::mouse::WheelTargetRefused>().is_some() => {
+                    use cua_driver_core::action_record::{
+                        ActionEffect, ActionExecutionRecord, RequestedDelivery,
+                    };
+                    let refusal = e.downcast_ref::<crate::input::mouse::WheelTargetRefused>()
+                        .expect("guarded wheel refusal type");
+                    ToolResult::error(format!("{e:#}"))
+                        .with_structured(json!({
+                            "status": "refused", "code": refusal.code.as_str(),
+                            "effect": "refused"
+                        }))
+                        .with_action_record(ActionExecutionRecord::new(
+                            ActionEffect::Refused,
+                            ActionTransport::WindowsSendInput,
+                            RequestedDelivery::Foreground,
+                        ))
+                }
+                Ok(Err(e)) => ToolResult::error(format!(
+                    "{e:#}; wheel dispatch was attempted; inspect the same target before any retry"
                 )),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+                Err(e) => ToolResult::error(format!("Task error: {e}; observe target before any retry")),
             };
         }
 
@@ -10743,5 +10987,144 @@ mod value_write_readback_tests {
             classify_value_write_readback(Some("unchanged"), "unchanged", "unchanged"),
             "pending"
         );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_owned_key_consumption_tests {
+    use super::{focus_cached_element_for_foreground, retained_keyboard_success_result};
+    use crate::input::keyboard::{send_retained_key_with_witness, KeyboardElementReferenceKind};
+    use crate::uia::cache::keyboard_focus_owned_fixture_tests::{
+        retained_native, Fixture, TestCom,
+    };
+
+    fn assert_actual_witness_wire_coherence(
+        witness: &crate::input::keyboard::KeyboardFocusWitness,
+    ) {
+        // Production branch and real-key fixture share one actual result producer.
+        // Exercise its public_result/serde/output-schema API boundaries. The
+        // other crate's private publish_action_result uses the same projection
+        // and preserves outer content; this is not a full Engine/session fixture.
+        let result = retained_keyboard_success_result(witness);
+        let public = result
+            .action_record
+            .as_ref()
+            .unwrap()
+            .public_result()
+            .unwrap();
+        public.validate_invariants().unwrap();
+        let mut raw = serde_json::to_value(&result).unwrap();
+        raw["structuredContent"] = serde_json::to_value(&public).unwrap();
+        let wire = cua_driver_core::mcp_result::conforming_tool_result("press_key", raw);
+        assert_ne!(wire["isError"], serde_json::json!(true));
+        assert!(wire.get("action_record").is_none());
+        assert_eq!(wire["structuredContent"]["effect"], "unverifiable");
+        assert_eq!(wire["structuredContent"]["route"], "global_input");
+        assert_eq!(wire["structuredContent"]["delivery"]["mode"], "foreground");
+        assert_eq!(
+            wire["structuredContent"]["delivery"]["delivered_count"],
+            witness.inserted_event_count
+        );
+        let line = wire["content"][0]["text"].as_str().unwrap();
+        assert_eq!(line, witness.diagnostic_text());
+        let payload = line
+            .strip_prefix(crate::input::keyboard::KEYBOARD_FOCUS_WITNESS_MARKER)
+            .unwrap();
+        assert!(payload.len() <= 2048 && !line.contains('\n'));
+        let fields: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(fields.as_object().unwrap().len(), 18);
+        assert_eq!(fields["inputAttempted"], true);
+        assert_eq!(
+            fields["insertedEventCount"],
+            wire["structuredContent"]["delivery"]["delivered_count"]
+        );
+        assert!(fields["failureCode"].is_null() && fields["providerFailureCode"].is_null());
+    }
+
+    /// Owned interactive desktop only. Calls the exact new foreground key backend
+    /// and its unchanged production focus callback; the source test has no raw tool
+    /// bypass, alternative actuator, application/customer window, or automatic retry.
+    #[test]
+    #[ignore = "requires exclusive interactive Windows desktop; actual existing SendInput on owned fixture"]
+    fn owned_edit_home_shift_end_then_one_unicode_replacement() {
+        let fixture = Fixture::start();
+        let _com = TestCom::start();
+        let admitted = Some(retained_native(fixture.first));
+        let element = admitted.as_ref().unwrap();
+        fixture.focus(false);
+        let initial = fixture.observe(false);
+        assert!(
+            initial.1 == "Fixture001",
+            "owned synthetic fixture seed mismatch"
+        );
+        assert_eq!(initial.0, (10, 10));
+        let sibling = fixture.observe(true);
+        // Refuse contaminated test desktops rather than releasing somebody else's
+        // modifiers or sending a chord with a different meaning.
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        };
+        for key in [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN] {
+            assert!(
+                unsafe { GetAsyncKeyState(key.0 as i32) } >= 0,
+                "owned fixture requires an exclusive desktop with no held modifiers"
+            );
+        }
+        for (key, modifiers, expected_selection) in [
+            ("home", Vec::<&str>::new(), (0, 0)),
+            ("end", vec!["shift"], (0, 10)),
+        ] {
+            let witness = send_retained_key_with_witness(
+                fixture.top,
+                std::process::id(),
+                key,
+                &modifiers,
+                KeyboardElementReferenceKind::IndexSnapshot,
+                element,
+                || focus_cached_element_for_foreground(&admitted, fixture.top, 0, None),
+            )
+            .unwrap();
+            assert_actual_witness_wire_coherence(&witness);
+            assert!(witness.input_attempted);
+            assert_eq!(
+                witness.inserted_event_count,
+                if modifiers.is_empty() { 2 } else { 4 }
+            );
+            fixture.wait_for_selection(expected_selection);
+            assert!(
+                fixture.observe(false).1 == "Fixture001",
+                "owned Edit value changed during selection-only keys"
+            );
+            assert!(
+                fixture.observe(true) == sibling,
+                "owned sibling changed during exact-target key delivery"
+            );
+        }
+        // Full selection is an observed prerequisite, not inferred from admission
+        // or SendInput count. One existing foreground Unicode actuator follows.
+        assert_eq!(fixture.observe(false).0, (0, 10));
+        crate::input::keyboard::send_text_synthesized_after_focus(
+            fixture.top,
+            "Fixture080",
+            || focus_cached_element_for_foreground(&admitted, fixture.top, 0, None),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fixture.observe(false).1 == "Fixture080" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned Edit did not consume one exact synthetic replacement"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fixture.observe(true) == sibling,
+            "owned sibling changed during exact-target replacement"
+        );
+        // Retained COM references drop, then test apartment, then Fixture Drop
+        // sends Stop and joins the owning thread, which destroys only its HWNDs.
     }
 }

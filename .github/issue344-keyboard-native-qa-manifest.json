@@ -1,0 +1,116 @@
+{
+  "sourceStatus": "author_frozen_for_native_qa",
+  "baseCommit": "36987990b292537770fe2df3a9e6dee2ef43db2f",
+  "baseCandidatePatchSha256": "02a81b766a75f1ca24db9b453d3c8545d469dbf328d9c3df79ec3892c0a1fc21",
+  "keyboardWitnessPatchSha256": "996046b4e93b8c14de8d9d20c51aa53c75bc0064fb5441b3b4413ce7c996b883",
+  "files": [
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs",
+      "originalSha256": "c1c038f202f664a5af133bcce12215f6d704e5b0029f45c6376bbd8420601129",
+      "priorCandidateSha256": "5cba8e206d55ba69b331f044694deee3e2c3d6985fbd82787a3d44112c15b9ca",
+      "candidateSha256": "59e36132b51d8c7949afcf92f3f9e74b4ac25f71bd868c9f8b206a9653a381c5"
+    },
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs",
+      "originalSha256": "ef92cbb8c8989092dfcd163d50ed74dc239d8ae9cdb45a2ffa98d49559f2841a",
+      "priorCandidateSha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09",
+      "candidateSha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09"
+    },
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs",
+      "originalSha256": "fe363d2af9781992bf3a6c636ae615fa6d624241ddbd8bd0d7980c5efc844b81",
+      "priorCandidateSha256": "c4c4debdb68edf61d02ae8cc640b63e8f4721a8f1a18091027d4add2198bb645",
+      "candidateSha256": "417f8e3b8c538d89546b1bf8528065786c9aee49a75a299aa17728ca91cf3037"
+    },
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs",
+      "originalSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
+      "priorCandidateSha256": "6ef598c8d22d4afb93f7b58c5063eef9b24fd9992c3e90871f09a51405b5f9fd",
+      "candidateSha256": "2a0ec24d9202b0971c82b7e4208552d46ce586f27a06ccc7a139070b4f3fc642"
+    }
+  ],
+  "nativeQa": {
+    "expectedPriorHelperTests": 13,
+    "target": "x86_64-pc-windows-msvc",
+    "rustToolchain": "1.97.1",
+    "nodeVersion": "24.19.0",
+    "sdkVersion": "0.28.2",
+    "unitGroups": [
+      {
+        "label": "wheel-target-admission",
+        "package": "platform-windows",
+        "filter": "input::mouse::wheel_target_admission_tests::",
+        "expected": 9
+      },
+      {
+        "label": "set-value-native-readback",
+        "package": "platform-windows",
+        "filter": "tools::impl_::set_value_native_readback_tests::",
+        "expected": 4
+      },
+      {
+        "label": "keyboard-production-dispatch-seam",
+        "package": "platform-windows",
+        "filter": "input::keyboard::keyboard_focus_witness_tests::",
+        "expected": 12
+      },
+      {
+        "label": "value-write-readback",
+        "package": "platform-windows",
+        "filter": "tools::impl_::value_write_readback_tests::",
+        "expected": 5
+      },
+      {
+        "label": "post-message-readback",
+        "package": "platform-windows",
+        "filter": "tools::impl_::post_message_readback_tests::",
+        "expected": 2
+      },
+      {
+        "label": "windows-delivery-guidance",
+        "package": "platform-windows",
+        "filter": "input::delivery::tests::",
+        "expected": 7
+      },
+      {
+        "label": "core-desktop-independent",
+        "package": "cua-driver-core",
+        "filter": "",
+        "expected": 623
+      },
+      {
+        "label": "sdk-abi",
+        "package": "cua-driver-sdk",
+        "filter": "abi::tests::",
+        "expected": 6
+      }
+    ],
+    "interactiveExcelAcceptance": "not_performed_by_this_workflow",
+    "ownedFixtures": [
+      {
+        "label": "owned-native-focus-admission",
+        "filter": "uia::cache::keyboard_focus_owned_fixture_tests::",
+        "expected": 1,
+        "ignoredByDefault": true,
+        "scope": "real_owned_Win32_UIA_focus_fake_insertion_only",
+        "actualSendInput": false,
+        "fieldConsumption": false
+      },
+      {
+        "label": "owned-native-key-consumption",
+        "filter": "tools::impl_::keyboard_owned_key_consumption_tests::",
+        "expected": 1,
+        "ignoredByDefault": true,
+        "scope": "actual_existing_Home_ShiftEnd_selection_then_Unicode_replacement_on_owned_Edit_only",
+        "actualSendInput": true,
+        "fieldConsumption": "synthetic_owned_Edit_only_not_Dell_Excel"
+      }
+    ],
+    "expectedNewWitnessTests": 12,
+    "expectedOwnedFixtures": 2,
+    "ownedKeyMetadataAssertion": "same production result owner; marker18 fields/actual delivered_count/effect/route/delivery projection consistency for each actual owned key; numeric SDK2/2/1 mapping source reviewed, not SDK OS transport runtime"
+  },
+  "authorManifestSha256": "8ca4ce8b16aceefbf600a0fdaa75f90c43a8ecd3faec8e7ed51159965576b7f1",
+  "sourceReviewBoundary": "metadata-v2 author final static/source/serialization review; parent fresh review and exact Windows QA pending",
+  "cumulativePatchRule": "public base + immutable02a81 + metadata-v2 996046 only; do not stack ab5 or separate COM patch"
+}
