@@ -1,0 +1,259 @@
+name: Issue344 four owned-fixture native proof diagnostics only
+
+on:
+  push:
+    branches: [source/issue344-native-proof-diag-20261010]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue344-native-proof-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  four-owned-cases:
+    if: github.repository == 'shannon0430/cua' && github.ref == 'refs/heads/source/issue344-native-proof-diag-20261010'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '4'
+      RUST_BACKTRACE: '0'
+      CUA_DRIVER_SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - name: Preserve exact LF source bytes
+        run: |
+          & git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve exact source bytes' }
+          & git config --global core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve LF source bytes' }
+      - name: Checkout exact diagnostic candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 32
+          persist-credentials: false
+      - name: Verify exact source and LF materialization
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & git config --local core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot pin checkout byte policy' }
+          & git config --local core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot pin LF checkout policy' }
+          & git checkout-index --force --all
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot materialize exact LF checkout' }
+          & git merge-base --is-ancestor a80258ee1ff1e1b38ca87eb571f4552c3b853c54 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic source must descend from exact a802 runtime' }
+          $source = (& git rev-parse HEAD).Trim()
+          if ($source -ne $env:GITHUB_SHA) { throw 'Exact diagnostic source mismatch' }
+      - name: Verify closed eight-path source against exact Git blobs
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess
+          base='a80258ee1ff1e1b38ca87eb571f4552c3b853c54'
+          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert source==os.environ['GITHUB_SHA']
+          paths=sorted([
+              '.github/workflows/issue344-native-input-proof-diagnostics.yml',
+              'libs/cua-driver/rust/crates/cua-driver/Cargo.toml',
+              'libs/cua-driver/rust/crates/cua-driver/tests/cross_platform_behavior_test.rs',
+              'libs/cua-driver/rust/crates/platform-windows/Cargo.toml',
+              'libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs',
+              'libs/cua-driver/rust/crates/platform-windows/src/input/mod.rs',
+              'libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs',
+              'libs/cua-driver/rust/crates/platform-windows/src/input/proof_diagnostics.rs',
+          ])
+          changed=sorted(subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines())
+          assert changed==paths, 'Exact eight-path source closure required'
+          preserved=[
+              'libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs',
+              'libs/cua-driver/docs/foreground-target-ownership.md',
+              'scripts/ci/windows/run-rust-e2e.ps1',
+              '.github/workflows/e2e-rust-windows.yml',
+              'libs/cua-driver/rust/Cargo.lock',
+          ]
+          rows=[]
+          for path in paths+preserved:
+              blob=subprocess.check_output(['git','show',source+':'+path])
+              if path in preserved:
+                  assert blob==subprocess.check_output(['git','show',base+':'+path])
+              p=pathlib.Path(path)
+              prior_matches=p.read_bytes()==blob
+              p.write_bytes(blob) # Explicit binary rematerialization: no PowerShell CRLF conversion.
+              actual=p.read_bytes()
+              assert actual==blob and b'\r\n' not in actual, 'Exact LF source blob required'
+              oid=subprocess.check_output(['git','rev-parse',source+':'+path],text=True).strip()
+              rows.append({'path':path,'sha256':hashlib.sha256(actual).hexdigest(),'bytes':len(actual),'gitBlobOid':oid,'priorCheckoutMatchedBlob':prior_matches,'rematerializedFromExactGitBlob':True,'runtimeContractUnchanged':path in preserved})
+          subprocess.check_call(['git','diff','--check',base,'HEAD'])
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'issue344-native-proof-diagnostics'
+          out.mkdir(exist_ok=True)
+          (out/'source-byte-binding.json').write_text(json.dumps({'sourceCommit':source,'baseRuntime':base,'closedChangedSourcePaths':paths,'actualSourceFiles':rows,'canonicalAllAccepted':False,'packageAccepted':False,'dellExcelAccepted':False},indent=2)+'\n',encoding='utf-8')
+      - name: Verify interactive owning desktop and exact MSVC toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\scripts\ci\windows\verify-user-session.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Interactive desktop required; no GUI skip' }
+          & .\scripts\ci\windows\setup-ffmpeg.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical trajectory tooling required' }
+          & rustup toolchain install 1.97.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned MSVC toolchain required' }
+          & rustup default 1.97.1
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select pinned toolchain' }
+          $hostInfo = (& rustc +1.97.1 -vV) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: x86_64-pc-windows-msvc') { throw 'Actual MSVC host required' }
+      - name: Compile native source and exercise bounded encoder only
+        working-directory: libs/cua-driver/rust
+        run: |
+          & cargo +1.97.1 test --locked -p platform-windows --features native-input-proof-diagnostics --lib --no-run
+          if ($LASTEXITCODE -ne 0) { throw 'Native production/test source did not compile' }
+          $testOutput = @(& cargo +1.97.1 test --locked -p platform-windows --features native-input-proof-diagnostics --lib input::proof_diagnostics::tests:: -- --test-threads=1 2>&1)
+          $testExit = $LASTEXITCODE
+          $testText = ($testOutput | ForEach-Object { $_.ToString() }) -join "`n"
+          $testOutput | Write-Host
+          if ($testExit -ne 0 -or $testText -notmatch 'test result: ok\. 8 passed; 0 failed; 0 ignored;') { throw 'Exactly eight bounded encoder tests required' }
+          & cargo +1.97.1 build --locked --release -p cua-driver --features native-input-proof-diagnostics
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic CLI build failed' }
+      - name: Build existing synthetic owning fixtures
+        run: |
+          & .\scripts\ci\windows\build-harnesses.ps1 -Targets @('electron', 'tauri', 'webview')
+          if ($LASTEXITCODE -ne 0) { throw 'Owning fixture build failed' }
+      - name: Run unchanged four required deliver cases with RequireGui and zero skips
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rust = (Get-Location).Path
+          $out = Join-Path $env:RUNNER_TEMP 'issue344-native-proof-diagnostics'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $out 'recordings') | Out-Null
+          $env:CUA_TEST_WORKSPACE_ROOT = $rust
+          $env:CUA_TEST_APPS_ROOT = Join-Path $rust 'test-apps'
+          $env:CUA_TEST_DRIVER_BIN = Join-Path $rust 'target/release/cua-driver.exe'
+          $env:CUA_TEST_DRIVER_STDERR = '1'
+          $env:CUA_TEST_REQUIRE_FIXTURES = '1'
+          $env:CUA_REQUIRE_GUI = '1'
+          $env:CUA_E2E_FORBID_SKIPS = '1'
+          $env:CUA_E2E_UNRESTRICTED_GUI = '1'
+          $env:CUA_E2E_SOURCE_SHA = $env:GITHUB_SHA
+          $env:CUA_DRIVER_SOURCE_SHA = $env:GITHUB_SHA
+          $env:CUA_E2E_EXPECTED_MIN_CELLS = '4'
+          $env:CUA_E2E_CELL_FILTER = 'windows-electron-scroll-px-foreground,windows-tauri-type-submit-ax-foreground,windows-tauri-press-key-ax-foreground,windows-tauri-scroll-px-foreground'
+          $env:CUA_E2E_DECLARATIONS_FILE = Join-Path $out 'cases.jsonl'
+          $env:CUA_E2E_ENVIRONMENT_FILE = Join-Path $out 'environment.jsonl'
+          $env:CUA_E2E_RESULTS_FILE = Join-Path $out 'results.jsonl'
+          $env:CUA_E2E_RECORDINGS_ROOT = Join-Path $out 'recordings'
+          foreach ($name in @('cases.jsonl', 'environment.jsonl', 'results.jsonl')) {
+            New-Item -ItemType File (Join-Path $out $name) | Out-Null
+          }
+          # Use the existing canonical desktop/UIA/capture/video preflight unchanged.
+          # Its log is separate: only the four cell-bound refusal records are collected.
+          $ErrorActionPreference = 'Continue'
+          & cargo +1.97.1 test --locked -p cua-driver --features native-input-proof-diagnostics --test e2e_environment_preflight_test -- --ignored --exact canonical_e2e_environment_is_ready --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath (Join-Path $out 'environment-preflight.log')
+          $preflightExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($preflightExit -ne 0) { throw 'Canonical owning environment preflight failed; no four-cell input matrix' }
+          $ErrorActionPreference = 'Continue'
+          & cargo +1.97.1 test --locked -p cua-driver --features native-input-proof-diagnostics --test cross_platform_behavior_test -- --ignored --exact shared_web_action_matrix_is_state_verified --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath (Join-Path $out 'four-case-original-harness.log')
+          $matrixExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          [ordered]@{ sourceCommit=$env:GITHUB_SHA; baseRuntime='a80258ee1ff1e1b38ca87eb571f4552c3b853c54'; matrixExitCode=$matrixExit; scope='diagnostic_four_owned_cases_only'; canonicalAllAccepted=$false; packageAccepted=$false; dellExcelAccepted=$false } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $out 'scope.json')
+          if ($matrixExit -ne 0) { throw "Original effect oracle failed ($matrixExit); diagnostic collection does not convert failure to success" }
+      - name: Preserve exact source-bound normal-form refusal diagnostics
+        if: always()
+        shell: python
+        run: |
+          import json, os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'issue344-native-proof-diagnostics'
+          p.mkdir(exist_ok=True)
+          expected={'windows-electron-scroll-px-foreground','windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground','windows-tauri-scroll-px-foreground'}
+          expected_ops={cell:('retained_key' if cell in {'windows-tauri-type-submit-ax-foreground','windows-tauri-press-key-ax-foreground'} else 'virtual_wheel') for cell in expected}
+          log=p/'four-case-original-harness.log'
+          rows=[]; current=None; begun=[]; ended=[]; error=None
+          allowed_keys=set('schema operation phase inputAttempted gate predicates aliases target root foreground active focus hover ownNative providerAnchor anchorParent scope virtualDocument windowless nonRootNativeAnchor providerPidPositive providerProcessClass anchorProcessClass anchorThreadClass additionalObservation matchesGateSnapshot traversalBoundary cursorMatchesGate status unavailable nodeBound depthBound cycle byteBound nodes alias parent processClass threadClass readable withinAdmittedRoot anchorIdentityMatches hoverWithinAnchor focusWithinAnchor'.split())
+          allowed_strings={'cua-native-input-proof-diagnostic/v1','retained_key','virtual_wheel','after_refusal','admittedRoot','complete','incomplete'}
+          def normal_form(value, depth=0):
+              assert depth <= 8
+              if isinstance(value,dict):
+                  assert len(value)<=32 and set(value).issubset(allowed_keys)
+                  for v in value.values(): normal_form(v,depth+1)
+              elif isinstance(value,list):
+                  assert len(value)<=64
+                  for v in value: normal_form(v,depth+1)
+              elif value is None or isinstance(value,bool): pass
+              elif isinstance(value,int): assert 0<=value<128
+              else: assert isinstance(value,str) and value in allowed_strings
+          try:
+              assert log.exists() and log.stat().st_size <= 8*1024*1024, 'bounded owning harness log missing'
+              for line in log.read_text(encoding='utf-8-sig').splitlines():
+                  for marker in ['CUA_NATIVE_INPUT_PROOF_CASE_V1 ', 'CUA_NATIVE_INPUT_PROOF_DIAGNOSTIC_V1 ']:
+                      if marker not in line: continue
+                      value=line.split(marker,1)[1]
+                      assert len((marker+value+'\n').encode()) <= 16384
+                      item=json.loads(value)
+                      if marker.startswith('CUA_NATIVE_INPUT_PROOF_CASE'):
+                          assert item['cellId'] in expected
+                          if item['phase']=='begin':
+                              assert current is None; current=item['cellId']; begun.append(current)
+                          else:
+                              assert item['phase']=='end' and item['cellId']==current
+                              ended.append(current); current=None
+                      else:
+                          assert current in expected and item['schema']=='cua-native-input-proof-diagnostic/v1'
+                          normal_form(item) # reject any raw identity/content/schema expansion before artifact write
+                          assert item['phase']=='after_refusal' and item['inputAttempted'] is False
+                          assert item['operation']==expected_ops[current], 'Refusal operation must match its exact owned case'
+                          assert len(item['additionalObservation'].get('nodes',[])) <= 64
+                          row={'cellId':current,'sourceCommit':os.environ['GITHUB_SHA'],'record':item}
+                          assert len((json.dumps(row,separators=(',',':'))+'\n').encode()) <= 16384
+                          rows.append(row)
+              assert current is None and len(begun)==4 and set(begun)==expected and begun==ended
+              assert len(rows)==4 and {r['cellId'] for r in rows}==expected, 'one refusal record per required case was not measured'
+              for name in ['results.jsonl','cases.jsonl','environment.jsonl']:
+                  assert (p/name).exists() and (p/name).stat().st_size<=8*1024*1024
+              results=[json.loads(l) for l in (p/'results.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
+              assert len(results)==4 and {r['cell_id'] for r in results}==expected
+              assert all(r['test_status']!='skip' and r['expected_behavior']=={'kind':'deliver'} for r in results)
+              cases=[json.loads(l) for l in (p/'cases.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
+              assert len(cases)==4 and {r['cell_id'] for r in cases}==expected
+              assert all(r['expected_behavior']=={'kind':'deliver'} for r in cases)
+              environments=[json.loads(l) for l in (p/'environment.jsonl').read_text(encoding='utf-8-sig').splitlines() if l.strip()]
+              assert environments and all(e['source_sha']==os.environ['GITHUB_SHA'] and e['status']=='ready' and e['platform']=='windows' and e['display_server']=='win32' for e in environments)
+          except Exception as exc:
+              error=type(exc).__name__ # never dump provider/log/environment values
+          with (p/'native-proof-diagnostics.jsonl').open('w',encoding='utf-8') as out:
+              for row in rows: out.write(json.dumps(row,separators=(',',':'))+'\n')
+          (p/'diagnostic-collection.json').write_text(json.dumps({'sourceCommit':os.environ['GITHUB_SHA'],'records':len(rows),'collectionComplete':error is None,'relationsReadyForCorrection':error is None and all(r['record']['additionalObservation'].get('status')=='complete' and r['record']['additionalObservation'].get('matchesGateSnapshot') is True for r in rows),'errorClass':error,'canonicalAllAccepted':False,'inputProofAuthorizedByDiagnostics':False},indent=2)+'\n')
+          if error: raise SystemExit('Native relation measurement incomplete; existing failure is preserved')
+      - name: Run existing owning result and trajectory report without changing acceptance
+        if: always()
+        working-directory: libs/cua-driver/rust
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'issue344-native-proof-diagnostics'
+          & cargo +1.97.1 run --locked -p cua-driver-testkit --bin cua-e2e-report -- --declarations (Join-Path $out 'cases.jsonl') --environment (Join-Path $out 'environment.jsonl') --results (Join-Path $out 'results.jsonl') --artifact-root $out --require-video --output (Join-Path $out 'summary.md')
+          if ($LASTEXITCODE -ne 0) { throw 'Owning report failed; failure remains failure' }
+          $videos = @(Get-ChildItem (Join-Path $out 'recordings') -Filter recording.mp4 -Recurse)
+          if ($videos.Count -eq 0) { throw 'No owning video evidence' }
+          foreach ($video in $videos) {
+            & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $video.FullName | Out-Null
+            if ($LASTEXITCODE -ne 0 -or $video.Length -eq 0) { throw 'Owning trajectory video unreadable' }
+          }
+      - name: Always upload bounded diagnostics and owning four-case evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: issue344-four-owned-native-proof-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/source-byte-binding.json
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/native-proof-diagnostics.jsonl
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/diagnostic-collection.json
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/scope.json
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/cases.jsonl
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/results.jsonl
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/environment.jsonl
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/summary.md
+            ${{ runner.temp }}/issue344-native-proof-diagnostics/recordings
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

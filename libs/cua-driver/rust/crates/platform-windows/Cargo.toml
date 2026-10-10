@@ -3,6 +3,11 @@ name = "platform-windows"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Diagnostic-only owned-fixture builds; never enabled in ordinary artifacts.
+native-input-proof-diagnostics = []
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -14,6 +14,9 @@ pub mod inject;
 pub mod keyboard;
 pub mod mouse;
 
+#[cfg(any(feature = "native-input-proof-diagnostics", test))]
+mod proof_diagnostics;
+
 pub(crate) use inject::{force_foreground_assisted, force_foreground_attached};
 pub use inject::{
     inject_click_screen, point_in_window_bounds, point_on_virtual_desktop, window_is_iconic,

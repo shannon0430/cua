@@ -1304,12 +1304,34 @@ fn confirm_virtual_wheel_native_relation(
             || unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(child, HWND(h as *mut _)) }
                 .as_bool()
     };
-    if !virtual_wheel_relation_admitted(
-        anchor,
-        refreshed,
-        belongs(latest.hover),
-        belongs(latest.focus),
-    ) {
+    let hover_within_anchor = belongs(latest.hover);
+    let focus_within_anchor = belongs(latest.focus);
+    if !virtual_wheel_relation_admitted(anchor, refreshed, hover_within_anchor, focus_within_anchor)
+    {
+        // One bounded private record only after the original guard refused.
+        #[cfg(feature = "native-input-proof-diagnostics")]
+        super::proof_diagnostics::record_refusal(
+            super::proof_diagnostics::Snapshot {
+                target: latest.target,
+                root: latest.root,
+                target_pid: latest.target_pid,
+                target_thread: latest.target_thread,
+                root_thread: latest.root_thread,
+                foreground: latest.foreground,
+                active: None, // the wheel guard did not sample native active HWND
+                focus: latest.focus,
+                hover: Some(latest.hover),
+                focus_pid: None, // these identities are additional observation, not gate facts
+                focus_thread: None,
+                point: Some(latest.cursor),
+                scope: anchor.into(),
+            },
+            super::proof_diagnostics::Predicates::Wheel {
+                anchor_identity: anchor == refreshed,
+                hover_within_anchor,
+                focus_within_anchor,
+            },
+        );
         bail!("wheel_focus_mismatch: latest native hover/focus or ownership is outside proved virtual anchor; no input was sent");
     }
     Ok(())

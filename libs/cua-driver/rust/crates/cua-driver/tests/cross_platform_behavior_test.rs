@@ -167,6 +167,24 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> String {
         .unwrap_or_else(|| "test panicked without a string payload".to_owned())
 }
 
+#[cfg(feature = "native-input-proof-diagnostics")]
+fn diagnostic_case_boundary(cell: &str, begin: bool) {
+    use std::io::Write as _;
+    // Fixed owned-fixture labels only; no caller/provider text enters diagnostics.
+    let label = match cell {
+        "windows-electron-scroll-px-foreground" => "windows-electron-scroll-px-foreground",
+        "windows-tauri-type-submit-ax-foreground" => "windows-tauri-type-submit-ax-foreground",
+        "windows-tauri-press-key-ax-foreground" => "windows-tauri-press-key-ax-foreground",
+        "windows-tauri-scroll-px-foreground" => "windows-tauri-scroll-px-foreground",
+        _ => return,
+    };
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "CUA_NATIVE_INPUT_PROOF_CASE_V1 {{\"phase\":\"{}\",\"cellId\":\"{label}\"}}",
+        if begin { "begin" } else { "end" }
+    );
+}
+
 fn run_host_case_with_outcome<F>(
     case: CaseSpec,
     spec: &HostSpec,
@@ -175,6 +193,8 @@ fn run_host_case_with_outcome<F>(
 where
     F: FnOnce(&mut Fixture) -> Observation,
 {
+    #[cfg(feature = "native-input-proof-diagnostics")]
+    diagnostic_case_boundary(&case.cell_id, true);
     write_declaration_from_env(&case).expect("write E2E case declaration");
     let started = Instant::now();
     let mut evidence = Evidence::default();
@@ -226,6 +246,8 @@ where
         observation.evidence = evidence.clone();
         observation
     }));
+    #[cfg(feature = "native-input-proof-diagnostics")]
+    diagnostic_case_boundary(&case.cell_id, false);
     match outcome {
         Ok(observation) => {
             let result = CaseResult::evaluate(case, observation, started.elapsed());

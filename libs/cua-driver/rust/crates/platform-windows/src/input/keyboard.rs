@@ -846,7 +846,32 @@ fn native_keyboard_correlation(
         return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
             .at(KeyboardNativeRejection::AnchorIdentity));
     }
-    if !(nearest == focus || unsafe { IsChild(nearest, focus) }.as_bool()) {
+    let focus_within_anchor = nearest == focus || unsafe { IsChild(nearest, focus) }.as_bool();
+    if !focus_within_anchor {
+        // Diagnostic-only observer runs after this refusal decision. It cannot
+        // authorize input and adds nothing to the accepted proof -> SendInput path.
+        #[cfg(feature = "native-input-proof-diagnostics")]
+        super::proof_diagnostics::record_refusal(
+            super::proof_diagnostics::Snapshot {
+                target: native.target,
+                root: native.root,
+                target_pid: native.target_pid,
+                target_thread: native.target_thread,
+                root_thread: native.foreground_thread,
+                foreground: native.foreground,
+                active: Some(native.active),
+                focus: native.focus,
+                hover: None,
+                focus_pid: Some(native.focus_pid),
+                focus_thread: Some(native.focus_thread),
+                point: None,
+                scope: scope.into(),
+            },
+            super::proof_diagnostics::Predicates::Key {
+                anchor_identity: true, // the preceding unchanged identity guard passed
+                focus_within_anchor,
+            },
+        );
         return Err(KeyboardWitnessFailureCode::NativeFocusMismatch
             .at(KeyboardNativeRejection::AnchorFocusRelation));
     }
