@@ -581,7 +581,7 @@ fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
 /// external Win32/UIA state instead of inferred from API return values or a
 /// fixed settle delay. The prior foreground is restored on every body/focus
 /// result after activation succeeds.
-fn with_confirmed_foreground<T>(
+pub(crate) fn with_confirmed_foreground<T>(
     target: HWND,
     operation: &str,
     focus: impl FnOnce() -> Result<()>,

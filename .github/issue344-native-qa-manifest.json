@@ -1,0 +1,31 @@
+{
+  "baseCommit": "36987990b292537770fe2df3a9e6dee2ef43db2f",
+  "patchSha256": "02a81b766a75f1ca24db9b453d3c8545d469dbf328d9c3df79ec3892c0a1fc21",
+  "files": [
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs",
+      "originalSha256": "c1c038f202f664a5af133bcce12215f6d704e5b0029f45c6376bbd8420601129",
+      "candidateSha256": "5cba8e206d55ba69b331f044694deee3e2c3d6985fbd82787a3d44112c15b9ca"
+    },
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs",
+      "originalSha256": "ef92cbb8c8989092dfcd163d50ed74dc239d8ae9cdb45a2ffa98d49559f2841a",
+      "candidateSha256": "f3136da18ab07ae9f895c82da1e778977d49e13b0597c5c41f53892ff6efdd09"
+    },
+    {
+      "path": "libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs",
+      "originalSha256": "fe363d2af9781992bf3a6c636ae615fa6d624241ddbd8bd0d7980c5efc844b81",
+      "candidateSha256": "c4c4debdb68edf61d02ae8cc640b63e8f4721a8f1a18091027d4add2198bb645"
+    }
+  ],
+  "nativeQa": {
+    "expectedHelperTests": 13,
+    "helperModuleCounts": {
+      "wheel": 9,
+      "setValue": 4
+    },
+    "target": "x86_64-pc-windows-msvc",
+    "sdkVersion": "0.28.2",
+    "interactiveAcceptance": "not_performed_by_this_workflow"
+  }
+}

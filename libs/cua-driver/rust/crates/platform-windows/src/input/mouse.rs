@@ -4,7 +4,7 @@
 //! (via ChildWindowFromPointEx), so the message never reaches the top-level
 //! chrome that would call SetForegroundWindow in response to WM_LBUTTONDOWN.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::thread::sleep;
 use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -921,61 +921,665 @@ fn wheel_mouse_data(ticks: i32) -> u32 {
     (WHEEL_DELTA * ticks) as u32
 }
 
-/// Synthesize a single mouse-wheel event at screen coordinates `(sx, sy)` via
-/// `SendInput`.
+/// Synthesize a desktop-scoped wheel event at `(sx, sy)`.
 ///
-/// The OS routes wheel input to the window **under the cursor**, not the
-/// foreground window, so we `SetCursorPos(sx, sy)` first to place the wheel
-/// over the intended target. `ticks` encodes both magnitude and direction:
-/// positive scrolls up (vertical) / right (horizontal), negative scrolls down /
-/// left — matching the `MOUSEEVENTF_WHEEL` / `MOUSEEVENTF_HWHEEL` convention
-/// where `mouseData = WHEEL_DELTA * ticks`.
-///
-/// Unlike [`send_click_synthesized`] this does NOT do a foreground swap: wheel
-/// delivery follows the cursor, so positioning the cursor is sufficient. The
-/// cursor is restored to its previous position afterward.
+/// Wheel routing depends on focus, the inactive-scroll setting and application
+/// message handling; cursor placement alone is not proof of target consumption.
+/// Window-scoped callers must use `send_wheel_synthesized_to_window` instead.
+/// An inserted input remains unverified until the caller observes the view.
 pub fn send_wheel_synthesized(sx: i32, sy: i32, ticks: i32, horizontal: bool) -> Result<()> {
+    send_wheel_synthesized_checked(sx, sy, ticks, horizontal, || Ok(()))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WheelTargetRefusalCode {
+    Unavailable,
+    Unsupported,
+}
+
+impl WheelTargetRefusalCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "wheel_target_unavailable",
+            Self::Unsupported => "wheel_target_unsupported",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct WheelTargetRefused {
+    pub(crate) code: WheelTargetRefusalCode,
+    message: String,
+}
+
+impl WheelTargetRefused {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: WheelTargetRefusalCode::Unavailable,
+            message: message.into(),
+        }
+    }
+    fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: WheelTargetRefusalCode::Unsupported,
+            message: message.into(),
+        }
+    }
+}
+
+/// The existing foreground transaction plus an exact wheel-target guard.
+/// It never clicks, selects an item, or sets control focus as a side effect.
+pub(crate) fn send_wheel_synthesized_to_window(
+    hwnd: u64,
+    expected_pid: u32,
+    sx: i32,
+    sy: i32,
+    ticks: i32,
+    horizontal: bool,
+) -> Result<()> {
+    let target = HWND(hwnd as *mut _);
+    let mut actual_pid = 0;
+    let thread = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            target,
+            Some(&mut actual_pid),
+        )
+    };
+    if thread == 0 || actual_pid != expected_pid {
+        return Err(WheelTargetRefused::unavailable(
+            "wheel_target_unavailable: target does not belong to expected process; no activation or input was attempted",
+        ).into());
+    }
+    // Existing UWP launch exposes the AFH frame HWND/PID, but hosted UIA
+    // focus has an app PID. The resolver proves physical hosting, not a
+    // unique cross-process focus authorization; do not widen this guard.
+    if crate::win32::resolve_uwp_app_pid(expected_pid, hwnd).is_some() {
+        return Err(WheelTargetRefused::unsupported(
+            "wheel_target_unsupported: ApplicationFrameHost hosted-content wheel is outside this candidate's verified target boundary; no activation or wheel input was attempted",
+        ).into());
+    }
+    let root = unsafe { GetAncestor(target, GA_ROOT) };
+    if root.0.is_null() {
+        return Err(WheelTargetRefused::unavailable(
+            "wheel_target_unavailable: target root disappeared; no input was sent",
+        )
+        .into());
+    }
+    let mut dispatch_attempted = false;
+    let result = crate::input::keyboard::with_confirmed_foreground(
+        root,
+        "wheel delivery",
+        || Ok(()),
+        || {
+            send_wheel_synthesized_checked(sx, sy, ticks, horizontal, || {
+                confirm_wheel_target(target, root, expected_pid, sx, sy)?;
+                dispatch_attempted = true;
+                Ok(())
+            })
+        },
+    );
+    if !dispatch_attempted {
+        result.map_err(|error| {
+            // A provider's IErrorInfo may contain arbitrary control content.
+            // Preserve only its HRESULT, not value/title strings.
+            let message = if let Some(native) = error.downcast_ref::<windows::core::Error>() {
+                format!(
+                    "wheel_target_unavailable: native target/focus query failed (HRESULT 0x{:08X})",
+                    native.code().0 as u32
+                )
+            } else {
+                format!("{error:#}")
+            };
+            WheelTargetRefused::unavailable(format!("{message}; no wheel input was sent")).into()
+        })
+    } else {
+        result
+    }
+}
+
+/// Admit a wheel only when native hover and focus belong to the exact root,
+/// and UIA identifies focus inside the nearest hovered scroll container.
+/// A same-process owner/sibling window is deliberately insufficient here.
+/// All UIA reads are observational; unavailable/ambiguous providers fail closed.
+fn confirm_wheel_target(
+    target: HWND,
+    root: HWND,
+    expected_pid: u32,
+    sx: i32,
+    sy: i32,
+) -> Result<()> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, UIA_DataGridControlTypeId,
+        UIA_ListControlTypeId, UIA_ScrollPatternId, UIA_TableControlTypeId, UIA_TreeControlTypeId,
+    };
+    let before_native = read_wheel_native_witness(target, root, expected_pid, sx, sy)?;
+
+    // Scope every COM owner so Release/CoUninitialize (which can RPC/pump
+    // messages) finish BEFORE the final native-only witness.
+    {
+        // Balance only a successful COM initialisation. An existing apartment with
+        // another concurrency model may still create the UIA object; never uninit it.
+        struct ComInit(bool);
+        impl Drop for ComInit {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { CoUninitialize() };
+                }
+            }
+        }
+        let _com = ComInit(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
+        let uia: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .context("wheel_focus_unverifiable: UIA unavailable; no input was sent")?;
+        let boundary = unsafe { uia.ElementFromHandle(target) }
+            .context("wheel_focus_unverifiable: exact UIA target unavailable; no input was sent")?;
+        let focused = unsafe { uia.GetFocusedElement() }
+            .context("wheel_focus_unverifiable: focused element unavailable; no input was sent")?;
+        if unsafe { focused.CurrentProcessId() }? as u32 != expected_pid {
+            bail!("wheel_focus_mismatch: focused UIA element belongs to another process; no input was sent");
+        }
+        let walker = unsafe { uia.RawViewWalker() }?;
+        let same = |left: &IUIAutomationElement, right: &IUIAutomationElement| -> Result<bool> {
+            Ok(unsafe { uia.CompareElements(left, right) }?.as_bool())
+        };
+        let parent = |element: &IUIAutomationElement| -> Result<IUIAutomationElement> {
+            Ok(unsafe { walker.GetParentElement(element) }?)
+        };
+        let hovered = unsafe { uia.ElementFromPoint(POINT { x: sx, y: sy }) }
+            .context("wheel_focus_unverifiable: hovered element unavailable; no input was sent")?;
+        if !wheel_focus_is_descendant(&hovered, &boundary, &boundary, same, parent)? {
+            bail!("wheel_target_unavailable: hovered UIA element is outside target; no input was sent");
+        }
+        // A list item can be hovered while its parent list owns focus. A dialog/
+        // pane is NOT enough: accepting that broad common ancestor would allow
+        // sibling edit focus (the observed Excel failure) to admit the wheel.
+        let scope = nearest_wheel_scope(hovered.clone(), &boundary, same, parent, |current| {
+            let kind = unsafe { current.CurrentControlType() }?;
+            Ok(kind == UIA_ListControlTypeId
+                || kind == UIA_TreeControlTypeId
+                || kind == UIA_TableControlTypeId
+                || kind == UIA_DataGridControlTypeId
+                || unsafe { current.GetCurrentPattern(UIA_ScrollPatternId) }.is_ok())
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wheel_focus_unverifiable: no precise hovered scroll container; no input was sent"
+            )
+        })?;
+        if !wheel_focus_is_descendant(&focused, &scope, &boundary, same, parent)? {
+            bail!("wheel_focus_mismatch: focus is outside hovered scroll container; no input was sent; focus the intended container with a separate standard action and take a fresh observation");
+        }
+
+        // Refresh all provider-derived identities/ancestry first. An unchanged
+        // HWND can still host a different virtual sibling control or scroll scope.
+        let now_boundary = unsafe { uia.ElementFromHandle(target) }?;
+        let now_hovered = unsafe { uia.ElementFromPoint(POINT { x: sx, y: sy }) }?;
+        let now_focused = unsafe { uia.GetFocusedElement() }?;
+        if !same(&boundary, &now_boundary)?
+            || !same(&hovered, &now_hovered)?
+            || !same(&focused, &now_focused)?
+            || !wheel_focus_is_descendant(&now_hovered, &now_boundary, &now_boundary, same, parent)?
+        {
+            bail!("wheel_target_unavailable: UIA target/hover/focus identity changed during admission; no input was sent");
+        }
+        let now_scope = nearest_wheel_scope(now_hovered, &now_boundary, same, parent, |current| {
+            let kind = unsafe { current.CurrentControlType() }?;
+            Ok(kind == UIA_ListControlTypeId
+                || kind == UIA_TreeControlTypeId
+                || kind == UIA_TableControlTypeId
+                || kind == UIA_DataGridControlTypeId
+                || unsafe { current.GetCurrentPattern(UIA_ScrollPatternId) }.is_ok())
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wheel_focus_unverifiable: hovered scroll scope disappeared; no input was sent"
+            )
+        })?;
+        if !same(&scope, &now_scope)?
+            || !wheel_focus_is_descendant(&now_focused, &now_scope, &now_boundary, same, parent)?
+        {
+            bail!("wheel_focus_mismatch: hovered scroll scope or focused-element membership changed; no input was sent");
+        }
+    }
+    // All UIA reads, interface Release and CoUninitialize have completed.
+    // No COM owner/drop/provider read lies between this witness and SendInput.
+    let final_native = read_wheel_native_witness(target, root, expected_pid, sx, sy)?;
+    if !wheel_native_witness_unchanged(&before_native, &final_native) {
+        bail!("wheel_target_unavailable: native target/root/hover/focus changed after provider reads; no input was sent");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WheelNativeWitness {
+    target: u64,
+    target_pid: u32,
+    target_thread: u32,
+    target_root: u64,
+    root: u64,
+    root_pid: u32,
+    root_thread: u32,
+    foreground: u64,
+    cursor: (i32, i32),
+    hover: u64,
+    hover_root: u64,
+    hover_in_target: bool,
+    focus: u64,
+    focus_root: u64,
+    focus_in_target: bool,
+}
+
+/// Native-only phase. This must run after the last UIA/provider callback.
+fn read_wheel_native_witness(
+    target: HWND,
+    root: HWND,
+    expected_pid: u32,
+    sx: i32,
+    sy: i32,
+) -> Result<WheelNativeWitness> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, IsChild, WindowFromPoint, GUITHREADINFO,
+    };
+    let mut target_pid = 0;
+    let target_thread = unsafe { GetWindowThreadProcessId(target, Some(&mut target_pid)) };
+    let mut root_pid = 0;
+    let root_thread = unsafe { GetWindowThreadProcessId(root, Some(&mut root_pid)) };
+    if root_thread == 0 {
+        bail!("wheel_target_unavailable: exact root thread disappeared; no input was sent");
+    }
+    let hover = unsafe { WindowFromPoint(POINT { x: sx, y: sy }) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetGUIThreadInfo(root_thread, &mut info) }?;
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor) }?;
+    let witness = WheelNativeWitness {
+        target: target.0 as u64,
+        target_pid,
+        target_thread,
+        target_root: unsafe { GetAncestor(target, GA_ROOT) }.0 as u64,
+        root: root.0 as u64,
+        root_pid,
+        root_thread,
+        foreground: unsafe { GetForegroundWindow() }.0 as u64,
+        cursor: (cursor.x, cursor.y),
+        hover: hover.0 as u64,
+        hover_root: unsafe { GetAncestor(hover, GA_ROOT) }.0 as u64,
+        hover_in_target: hover == target || unsafe { IsChild(target, hover) }.as_bool(),
+        focus: info.hwndFocus.0 as u64,
+        focus_root: unsafe { GetAncestor(info.hwndFocus, GA_ROOT) }.0 as u64,
+        focus_in_target: info.hwndFocus == target
+            || unsafe { IsChild(target, info.hwndFocus) }.as_bool(),
+    };
+    if !wheel_native_witness_valid(&witness, expected_pid, (sx, sy)) {
+        bail!("wheel_target_unavailable: exact native target/hover/focus containment could not be confirmed; no input was sent");
+    }
+    Ok(witness)
+}
+
+fn wheel_native_witness_valid(
+    w: &WheelNativeWitness,
+    expected_pid: u32,
+    point: (i32, i32),
+) -> bool {
+    w.target != 0
+        && w.target_pid == expected_pid
+        && w.target_thread != 0
+        && w.root != 0
+        && w.root_pid != 0
+        && w.root_thread != 0
+        && w.target_root == w.root
+        && w.foreground == w.root
+        && w.cursor == point
+        && w.hover != 0
+        && w.hover_root == w.root
+        && w.hover_in_target
+        && w.focus != 0
+        && w.focus_root == w.root
+        && w.focus_in_target
+}
+
+fn wheel_native_witness_unchanged(before: &WheelNativeWitness, after: &WheelNativeWitness) -> bool {
+    before == after
+}
+
+fn send_wheel_synthesized_checked(
+    sx: i32,
+    sy: i32,
+    ticks: i32,
+    horizontal: bool,
+    before_send: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let flag = if horizontal {
         MOUSEEVENTF_HWHEEL
     } else {
         MOUSEEVENTF_WHEEL
     };
-    let mouse_data = wheel_mouse_data(ticks);
-
     let wheel_input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
                 dx: 0,
                 dy: 0,
-                mouseData: mouse_data,
+                mouseData: wheel_mouse_data(ticks),
                 dwFlags: flag,
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     };
-
-    unsafe {
-        let mut prev_cursor = POINT::default();
-        let _ = GetCursorPos(&mut prev_cursor);
-
-        // Wheel routes to the window under the cursor — place it on the target.
-        let _ = SetCursorPos(sx, sy);
-
-        let events = [wheel_input];
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != events.len() {
-            let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
-            bail!("SendInput inserted {sent}/{} wheel events", events.len());
+    let mut prev_cursor = POINT::default();
+    unsafe { GetCursorPos(&mut prev_cursor) }
+        .context("wheel cursor capture failed; no input was sent")?;
+    let result = (|| {
+        unsafe { SetCursorPos(sx, sy) }
+            .context("wheel cursor positioning failed; no input was sent")?;
+        let mut placed = POINT::default();
+        unsafe { GetCursorPos(&mut placed) }?;
+        if placed.x != sx || placed.y != sy {
+            bail!("wheel cursor was clipped or moved; no input was sent");
         }
-
-        // Brief settle, then restore the cursor.
+        insert_wheel_after_admission(before_send, || {
+            let events = [wheel_input];
+            let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+            if sent as usize != events.len() {
+                bail!("SendInput inserted {sent}/{} wheel events", events.len());
+            }
+            Ok(())
+        })?;
         sleep(Duration::from_millis(20));
-        let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
+        Ok(())
+    })();
+    // Redact arbitrary native IErrorInfo before combining two failures.
+    let result = result.map_err(|error: anyhow::Error| {
+        if let Some(native) = error.downcast_ref::<windows::core::Error>() {
+            anyhow::anyhow!(
+                "wheel native operation failed (HRESULT 0x{:08X})",
+                native.code().0 as u32
+            )
+        } else {
+            error
+        }
+    });
+    let restoration_hresult = unsafe { SetCursorPos(prev_cursor.x, prev_cursor.y) }
+        .err()
+        .map(|error| error.code().0 as u32);
+    combine_wheel_and_restore(result, restoration_hresult)
+}
+
+/// Preserve restoration limitations even when admission/dispatch also failed.
+/// The primary error is already redacted by the caller; only a numeric native
+/// restoration HRESULT is admitted here. Neither operation is retried.
+fn combine_wheel_and_restore(result: Result<()>, restoration_hresult: Option<u32>) -> Result<()> {
+    match (result, restoration_hresult) {
+        (Ok(()), None) => Ok(()),
+        (Err(primary), None) => Err(primary),
+        (Err(primary), Some(code)) => Err(primary.context(format!(
+            "cursor restoration also failed (HRESULT 0x{code:08X}); pointer position may be changed; no automatic retry was performed"
+        ))),
+        (Ok(()), Some(code)) => bail!(
+            "wheel input was inserted but cursor restoration failed (HRESULT 0x{code:08X}); observe the same target before any retry"
+        ),
+    }
+}
+
+// Shared production boundaries: injectable operations allow native unit tests
+// to prove that an admission miss cannot cross the SendInput boundary.
+fn insert_wheel_after_admission(
+    admit: impl FnOnce() -> Result<()>,
+    insert: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    admit()?;
+    insert()
+}
+
+fn wheel_focus_is_descendant<T: Clone>(
+    element: &T,
+    ancestor: &T,
+    boundary: &T,
+    same: impl Fn(&T, &T) -> Result<bool>,
+    parent: impl Fn(&T) -> Result<T>,
+) -> Result<bool> {
+    let mut current = element.clone();
+    for _ in 0..32 {
+        if same(&current, ancestor)? {
+            return Ok(true);
+        }
+        if same(&current, boundary)? {
+            return Ok(false);
+        }
+        current = parent(&current)?;
+    }
+    Ok(false)
+}
+
+fn nearest_wheel_scope<T: Clone>(
+    mut current: T,
+    boundary: &T,
+    same: impl Fn(&T, &T) -> Result<bool>,
+    parent: impl Fn(&T) -> Result<T>,
+    is_scope: impl Fn(&T) -> Result<bool>,
+) -> Result<Option<T>> {
+    for _ in 0..32 {
+        if is_scope(&current)? {
+            return Ok(Some(current));
+        }
+        if same(&current, boundary)? {
+            return Ok(None);
+        }
+        current = parent(&current)?;
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod wheel_target_admission_tests {
+    use super::{
+        combine_wheel_and_restore, insert_wheel_after_admission, nearest_wheel_scope,
+        wheel_focus_is_descendant, wheel_native_witness_unchanged, wheel_native_witness_valid,
+        WheelNativeWitness, WheelTargetRefused,
+    };
+    use anyhow::{bail, Result};
+    use std::cell::Cell;
+
+    // IDs model a shared-HWND dialog: root=1, list=2, item=3,
+    // sibling edit=4. The same production traversal uses UIA identity/parents.
+    fn parent(node: &u8) -> Result<u8> {
+        match node {
+            3 => Ok(2),
+            2 | 4 => Ok(1),
+            _ => bail!("no readable parent"),
+        }
+    }
+    fn same(a: &u8, b: &u8) -> Result<bool> {
+        Ok(a == b)
     }
 
-    Ok(())
+    #[test]
+    fn unsupported_hosted_target_has_distinct_refusal_code() {
+        assert_eq!(
+            WheelTargetRefused::unsupported("hosted target outside supported boundary")
+                .code
+                .as_str(),
+            "wheel_target_unsupported"
+        );
+        assert_eq!(
+            WheelTargetRefused::unavailable("target changed")
+                .code
+                .as_str(),
+            "wheel_target_unavailable"
+        );
+    }
+
+    fn witness() -> WheelNativeWitness {
+        WheelNativeWitness {
+            target: 11,
+            target_pid: 100,
+            target_thread: 200,
+            target_root: 10,
+            root: 10,
+            root_pid: 100,
+            root_thread: 200,
+            foreground: 10,
+            cursor: (150, 170),
+            hover: 12,
+            hover_root: 10,
+            hover_in_target: true,
+            focus: 13,
+            focus_root: 10,
+            focus_in_target: true,
+        }
+    }
+
+    #[test]
+    fn changed_native_child_or_reparent_after_provider_reads_cannot_insert() {
+        let before = witness();
+        assert!(wheel_native_witness_valid(&before, 100, (150, 170)));
+        let calls = Cell::new(0);
+        let mut changed_hover = before;
+        changed_hover.hover = 14; // Different child, still within the same root.
+        let mut reparented_hover = before;
+        reparented_hover.hover_in_target = false;
+        let mut reparented_target = before;
+        reparented_target.target_root = 99;
+        let mut reparented_focus = before;
+        reparented_focus.focus_root = 99;
+        let mut replaced_process = before;
+        replaced_process.target_pid = 101;
+        for after in [
+            changed_hover,
+            reparented_hover,
+            reparented_target,
+            reparented_focus,
+            replaced_process,
+        ] {
+            let result = insert_wheel_after_admission(
+                || {
+                    if !wheel_native_witness_valid(&after, 100, (150, 170))
+                        || !wheel_native_witness_unchanged(&before, &after)
+                    {
+                        bail!("native witness changed after provider phase");
+                    }
+                    Ok(())
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn native_focus_cursor_or_owner_drift_fails_final_witness() {
+        let before = witness();
+        let mut focus = before;
+        focus.focus = 14;
+        let mut cursor = before;
+        cursor.cursor = (1, 1);
+        let mut root_owner = before;
+        root_owner.root_pid = 101;
+        for after in [focus, cursor, root_owner] {
+            assert!(!wheel_native_witness_unchanged(&before, &after));
+        }
+        assert!(!wheel_native_witness_valid(&cursor, 100, (150, 170)));
+        assert!(wheel_native_witness_unchanged(&before, &before));
+    }
+
+    #[test]
+    fn admission_and_restoration_failures_are_both_preserved() {
+        let error = combine_wheel_and_restore(
+            Err(anyhow::anyhow!("focus mismatch; no wheel inserted")),
+            Some(0x80070005),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("focus mismatch; no wheel inserted"));
+        assert!(message.contains("cursor restoration also failed (HRESULT 0x80070005)"));
+    }
+
+    #[test]
+    fn dispatch_and_restoration_failures_are_both_preserved() {
+        let error = combine_wheel_and_restore(
+            Err(anyhow::anyhow!("SendInput inserted 0/1")),
+            Some(0x80070005),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("SendInput inserted 0/1"));
+        assert!(message.contains("cursor restoration also failed (HRESULT 0x80070005)"));
+        assert!(combine_wheel_and_restore(Ok(()), None).is_ok());
+        let after_input = combine_wheel_and_restore(Ok(()), Some(0x80070005))
+            .unwrap_err()
+            .to_string();
+        assert!(after_input.contains("wheel input was inserted"));
+    }
+
+    #[test]
+    fn focused_list_descendant_passes_sibling_edit_does_not() {
+        let scope = nearest_wheel_scope(3, &1, same, parent, |node| Ok(*node == 2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope, 2);
+        assert!(wheel_focus_is_descendant(&3, &scope, &1, same, parent).unwrap());
+        assert!(wheel_focus_is_descendant(&2, &scope, &1, same, parent).unwrap());
+        assert!(!wheel_focus_is_descendant(&4, &scope, &1, same, parent).unwrap());
+    }
+
+    #[test]
+    fn dialog_boundary_does_not_expand_to_unrelated_scroll_scope() {
+        assert!(
+            nearest_wheel_scope(4, &1, same, parent, |node| Ok(*node == 9))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            nearest_wheel_scope(3, &1, same, |_| bail!("provider failed"), |_| Ok(false)).is_err()
+        );
+        assert!(wheel_focus_is_descendant(&3, &2, &1, same, |_| bail!("provider failed")).is_err());
+    }
+
+    #[test]
+    fn refusal_cannot_insert_input_and_admission_inserts_exactly_once() {
+        let calls = Cell::new(0);
+        let rejected = insert_wheel_after_admission(
+            || bail!("focus mismatch"),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(rejected.is_err());
+        assert_eq!(calls.get(), 0);
+        insert_wheel_after_admission(
+            || Ok(()),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn cyclic_or_overdeep_provider_tree_fails_closed() {
+        assert!(!wheel_focus_is_descendant(&3, &2, &1, same, |node| Ok(*node)).unwrap());
+        assert!(
+            nearest_wheel_scope(3, &1, same, |node| Ok(*node), |_| Ok(false))
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 /// Return the current foreground window for desktop-scope keyboard and drag

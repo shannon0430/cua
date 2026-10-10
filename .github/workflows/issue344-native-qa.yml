@@ -1,0 +1,293 @@
+name: Issue344 native Windows compile, tests and SDK loading QA
+
+on:
+  push:
+    branches: [source/issue344-native-qa-20261010]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue344-native-qa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-msvc:
+    if: github.repository == 'shannon0430/cua' && github.ref == 'refs/heads/source/issue344-native-qa-20261010'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      QA_ARTIFACT_REL: issue344-native-qa
+      CARGO_BUILD_JOBS: '4'
+      RUST_BACKTRACE: '0'
+    steps:
+      - name: Preserve exact LF source bytes for hash verification
+        run: |
+          & git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve exact source bytes' }
+
+      - name: Checkout exact pushed candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # upstream v4 pin
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify final source manifest and record honest QA scope
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $manifestPath = '.github/issue344-native-qa-manifest.json'
+          $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+          $base = '36987990b292537770fe2df3a9e6dee2ef43db2f'
+          if ($manifest.baseCommit -ne $base) { throw 'Unexpected public source base' }
+          if ($manifest.patchSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Final patch provenance hash required' }
+          if ([int]$manifest.nativeQa.expectedHelperTests -lt 8) { throw 'Explicit final helper test count required' }
+          if ($manifest.nativeQa.expectedHelperTests -isnot [int64] -and $manifest.nativeQa.expectedHelperTests -isnot [int32]) { throw 'Expected helper count must be a JSON integer' }
+          & git cat-file -e "$base^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw 'Base commit missing; candidate must directly descend from exact public base' }
+          & git merge-base --is-ancestor $base HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate does not descend from expected base' }
+          $sourcePaths = @(
+            'libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs',
+            'libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs',
+            'libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs'
+          )
+          $allowed = $sourcePaths + @($manifestPath, '.github/workflows/issue344-native-qa.yml')
+          $changed = @(& git diff --name-only $base HEAD)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source changes' }
+          foreach ($path in $changed) {
+            if ($path -notin $allowed) { throw "Out-of-scope candidate file: $path" }
+          }
+          if (@($manifest.files).Count -ne 3) { throw 'Exactly three causal source records required' }
+          foreach ($path in $sourcePaths) {
+            if ($path -notin $changed) { throw "Expected causal source change missing: $path" }
+            $entries = @($manifest.files | Where-Object { $_.path -eq $path })
+            if ($entries.Count -ne 1) { throw "Unique manifest record required: $path" }
+            $entry = $entries[0]
+            if ($entry.candidateSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Final source hash required' }
+            $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            if ($actual -ne $entry.candidateSha256) { throw "Candidate source hash mismatch: $path" }
+          }
+          & git diff --check $base HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace check failed' }
+          $sessionId = (Get-Process -Id $PID).SessionId
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceSha -ne $env:GITHUB_SHA) { throw 'Checkout SHA mismatch' }
+          $scope = [ordered]@{
+            sourceCommit = $sourceSha
+            publicBaseCommit = $base
+            finalPatchSha256 = $manifest.patchSha256
+            finalSourceFiles = $manifest.files
+            changedFiles = $changed
+            expectedHelperTests = [int]$manifest.nativeQa.expectedHelperTests
+            repository = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+            windowsSessionId = $sessionId
+            sessionZero = ($sessionId -eq 0)
+            nativeTestScope = 'Compiled MSVC Rust tests; selected desktop-independent production-path unit/ABI tests only'
+            interactiveValidation = 'not_performed_even_if_session_id_is_nonzero'
+            uiAcceptance = 'pending_separate_authenticated_desktop_fixture'
+            capture = 'not_performed'
+            input = 'not_performed'
+            customerData = 'none'
+            separateComBorrowPatch = 'excluded_by_changed_file_allowlist'
+          }
+          $scope | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 (Join-Path $out 'source-and-scope.json')
+          Copy-Item $manifestPath (Join-Path $out 'final-source-manifest.json')
+          "Session ID: $sessionId. Interactive UI/capture/input acceptance is NOT performed by this job."
+          "CARGO_HOME=$(Join-Path $env:RUNNER_TEMP 'issue344-cargo')" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'issue344-target')" >> $env:GITHUB_ENV
+
+      - name: Install exact official Rust toolchain and MSVC target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & rustup toolchain install 1.97.1 --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust toolchain install failed' }
+          $targets = @(& rustup target list --installed --toolchain 1.97.1)
+          if ($LASTEXITCODE -ne 0 -or 'x86_64-pc-windows-msvc' -notin $targets) { throw 'MSVC std target unavailable' }
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          $versions = [ordered]@{
+            rustc = (& rustc +1.97.1 --version | Out-String).Trim()
+            cargo = (& cargo +1.97.1 --version | Out-String).Trim()
+            rustTarget = 'x86_64-pc-windows-msvc'
+            installedRustTargets = $targets
+            node = (& node --version | Out-String).Trim()
+            npm = (& npm --version | Out-String).Trim()
+          }
+          $versions | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $out 'toolchain.json')
+          $sourcePaths = @(
+            'libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs',
+            'libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs',
+            'libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs'
+          )
+          & rustfmt +1.97.1 --edition 2021 --check @sourcePaths
+          if ($LASTEXITCODE -ne 0) { throw 'Changed Rust source formatting failed' }
+
+      - name: Native MSVC compile and selected production-path regressions
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          $results = [System.Collections.Generic.List[object]]::new()
+          function Invoke-CargoLogged([string]$Label, [string[]]$CargoArguments) {
+            $logPath = Join-Path $out "$Label.log"
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+              & cargo +1.97.1 @CargoArguments 2>&1 | Tee-Object -FilePath $logPath | ForEach-Object { Write-Host "$_" }
+              $code = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $previousPreference }
+            if ($code -ne 0) { throw "$Label failed with exit $code" }
+            return $logPath
+          }
+          function Invoke-SelectedTests([string]$Label, [string]$Package, [string]$Filter, [int]$MinimumPassed, [bool]$StrictCount) {
+            $testArgs = @('test', '-p', $Package, '--lib', '--target', 'x86_64-pc-windows-msvc', '--locked')
+            if ($Filter) { $testArgs += $Filter }
+            $listLog = Invoke-CargoLogged "$Label-list" ($testArgs + @('--', '--list'))
+            $listed = @(Get-Content $listLog | Where-Object { $_ -match ': test$' }).Count
+            if ($listed -lt $MinimumPassed) { throw "$Label matched too few tests ($listed)" }
+            $runLog = Invoke-CargoLogged "$Label-run" ($testArgs + @('--', '--test-threads=1'))
+            $summary = [regex]::Match((Get-Content -Raw $runLog), 'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+            if (-not $summary.Success) { throw "$Label has no passing test summary" }
+            $passed = [int]$summary.Groups[1].Value
+            $failed = [int]$summary.Groups[2].Value
+            $ignored = [int]$summary.Groups[3].Value
+            if ($failed -ne 0 -or $passed -lt $MinimumPassed) { throw "$Label failed pass-count verification" }
+            if ($StrictCount -and ($passed -ne $listed -or $ignored -ne 0)) { throw "$Label did not execute every selected test" }
+            $results.Add([ordered]@{ label=$Label; package=$Package; filter=$Filter; listed=$listed; passed=$passed; failed=$failed; ignored=$ignored })
+            $results | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'native-unit-test-results.json')
+            return $passed
+          }
+          $null = Invoke-CargoLogged 'native-msvc-compile-tests' @(
+            'test', '-p', 'platform-windows', '-p', 'cua-driver-core', '-p', 'cua-driver-sdk',
+            '--tests', '--no-run', '--locked', '--target', 'x86_64-pc-windows-msvc'
+          )
+          $wheelPassed = Invoke-SelectedTests 'wheel-target-admission' 'platform-windows' 'input::mouse::wheel_target_admission_tests::' 1 $true
+          $valuePassed = Invoke-SelectedTests 'set-value-native-readback' 'platform-windows' 'tools::impl_::set_value_native_readback_tests::' 1 $true
+          $scope = Get-Content -Raw (Join-Path $out 'source-and-scope.json') | ConvertFrom-Json
+          if (($wheelPassed + $valuePassed) -ne [int]$scope.expectedHelperTests) { throw 'Final helper count differs from parent-staged manifest' }
+          $null = Invoke-SelectedTests 'value-write-readback' 'platform-windows' 'tools::impl_::value_write_readback_tests::' 1 $true
+          $null = Invoke-SelectedTests 'post-message-readback' 'platform-windows' 'tools::impl_::post_message_readback_tests::' 1 $true
+          $null = Invoke-SelectedTests 'windows-delivery-guidance' 'platform-windows' 'input::delivery::tests::' 1 $true
+          $null = Invoke-SelectedTests 'core-desktop-independent' 'cua-driver-core' '' 1 $false
+          $null = Invoke-SelectedTests 'sdk-abi' 'cua-driver-sdk' 'abi::tests::' 6 $true
+
+      - name: Build ordinary MSVC driver, UIAccess worker and SDK release artifacts
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          & cargo +1.97.1 build --locked -p cua-driver -p cua-driver-uia -p cua-driver-sdk --release --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath (Join-Path $out 'native-msvc-release-build.log')
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($code -ne 0) { throw "Release build failed with exit $code" }
+          $release = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release'
+          $artifactDir = Join-Path $out 'unsigned-native-build'
+          New-Item -ItemType Directory -Force $artifactDir | Out-Null
+          $hashes = foreach ($name in @('cua-driver.exe', 'cua-driver-uia.exe', 'cua_driver_sdk.dll')) {
+            $path = Join-Path $release $name
+            if (-not (Test-Path $path)) { throw "Expected native artifact missing: $name" }
+            Copy-Item $path (Join-Path $artifactDir $name)
+            [ordered]@{ name=$name; sha256=(Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant(); bytes=(Get-Item $path).Length }
+          }
+          $hashes | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'native-artifact-hashes.json')
+
+      - name: Official npm 0.28.2 baseline and candidate SDK import/checksum smoke only
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          $smoke = Join-Path $env:RUNNER_TEMP 'issue344-npm-smoke'
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Set-Content -Encoding ascii (Join-Path $smoke '.npmrc') 'registry=https://registry.npmjs.org/'
+          $env:NPM_CONFIG_USERCONFIG = Join-Path $smoke '.npmrc'
+          Push-Location $smoke
+          try {
+            & npm init --yes 2>&1 | Tee-Object -FilePath (Join-Path $out 'npm-init.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated npm package init failed' }
+            & npm install --ignore-scripts --no-audit --no-fund --save-exact --registry=https://registry.npmjs.org/ '@trycua/cua-driver@0.28.2' '@trycua/cua-driver-win32-x64-msvc@0.28.2' 2>&1 | Tee-Object -FilePath (Join-Path $out 'npm-install.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Official npm 0.28.2 package install failed' }
+            $nodeScript = @'
+          import assert from 'node:assert/strict';
+          import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { resolve, join } from 'node:path';
+          const [phase, resultPath, expectedDllHash] = process.argv.slice(2);
+          assert.equal(process.platform, 'win32');
+          assert.equal(process.arch, 'x64');
+          const nativeDir = resolve('node_modules/@trycua/cua-driver-win32-x64-msvc');
+          const publicDir = resolve('node_modules/@trycua/cua-driver');
+          const nativePackage = JSON.parse(readFileSync(join(nativeDir, 'package.json'), 'utf8'));
+          const publicPackage = JSON.parse(readFileSync(join(publicDir, 'package.json'), 'utf8'));
+          assert.equal(nativePackage.version, '0.28.2');
+          assert.equal(publicPackage.version, '0.28.2');
+          const digest = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+          const dll = join(nativeDir, 'cua_driver_sdk.dll');
+          const addon = join(nativeDir, 'cua_driver_node_runtime.node');
+          assert(existsSync(dll) && existsSync(addon));
+          const dllHash = digest(dll);
+          if (expectedDllHash !== '-') assert.equal(dllHash, expectedDllHash);
+          // Official native/index initializes both generated components at import,
+          // opening the adjacent DLL and checking UniFFI contract and API checksums.
+          // No CuaDriver constructor or OS action is invoked by this smoke.
+          const api = await import('@trycua/cua-driver');
+          assert.equal(typeof api.CuaDriver, 'function');
+          assert.equal(typeof api.CuaDriver.createWithClientKind, 'function');
+          const result = {
+            phase, importVerified: true, packageVersion: publicPackage.version,
+            nodeVersion: process.version, nodeAbi: process.versions.modules,
+            napiVersion: process.versions.napi, sdkDllSha256: dllHash,
+            officialNodeAddonSha256: digest(addon),
+            ffiInitialization: 'official_generated_contract_and_checksum_initialization',
+            driverConstructed: false, sessionCreated: false, capture: false, input: false,
+            interactiveAcceptance: 'not_performed'
+          };
+          writeFileSync(resultPath, JSON.stringify(result, null, 2) + '\n');
+          console.log(JSON.stringify(result));
+          '@
+            Set-Content -Encoding utf8 (Join-Path $smoke 'import-smoke.mjs') $nodeScript
+            & node (Join-Path $smoke 'import-smoke.mjs') 'official-baseline' (Join-Path $out 'npm-official-baseline-import.json') '-' 2>&1 | Tee-Object -FilePath (Join-Path $out 'npm-official-baseline-import.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Official native SDK baseline import failed' }
+            $nativeDir = Join-Path $smoke 'node_modules/@trycua/cua-driver-win32-x64-msvc'
+            $officialAddon = Join-Path $nativeDir 'cua_driver_node_runtime.node'
+            $addonBefore = (Get-FileHash -Algorithm SHA256 $officialAddon).Hash.ToLowerInvariant()
+            $candidateDll = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/cua_driver_sdk.dll'
+            $expectedDllHash = (Get-FileHash -Algorithm SHA256 $candidateDll).Hash.ToLowerInvariant()
+            Copy-Item $candidateDll (Join-Path $nativeDir 'cua_driver_sdk.dll') -Force
+            # Fresh Node process avoids returning an already-loaded official DLL.
+            & node (Join-Path $smoke 'import-smoke.mjs') 'candidate-adjacent-sdk' (Join-Path $out 'npm-candidate-sdk-import.json') $expectedDllHash 2>&1 | Tee-Object -FilePath (Join-Path $out 'npm-candidate-sdk-import.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate SDK/official Node addon import failed' }
+            if ((Get-FileHash -Algorithm SHA256 $officialAddon).Hash.ToLowerInvariant() -ne $addonBefore) { throw 'Official Node addon changed unexpectedly' }
+            Copy-Item (Join-Path $smoke 'package-lock.json') (Join-Path $out 'official-npm-package-lock.json')
+          } finally { Pop-Location }
+
+      - name: Record final QA boundary in run summary
+        if: always()
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP $env:QA_ARTIFACT_REL
+          @(
+            '## Issue344 native compile/SDK QA only',
+            '',
+            'This job does not prove Excel set_value, wheel targeting, full-selection keyboard behavior, UIA provider behavior, or authenticated desktop acceptance.',
+            'Native MSVC compilation, selected desktop-independent unit/ABI tests and import/checksum smoke are separately recorded in the artifact.',
+            'Session 0 (if observed) is reported honestly; no capture, input or GUI acceptance is simulated.',
+            'Unsigned binaries are test-only artifacts. No production deployment or live DLL replacement is performed.'
+          ) | Set-Content -Encoding utf8 (Join-Path $out 'QA-BOUNDARY.md')
+          Get-Content (Join-Path $out 'QA-BOUNDARY.md') >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload native QA logs, provenance and unsigned test artifacts
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # upstream v4 pin
+        with:
+          name: issue344-native-msvc-qa-${{ github.sha }}
+          path: ${{ runner.temp }}/issue344-native-qa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
