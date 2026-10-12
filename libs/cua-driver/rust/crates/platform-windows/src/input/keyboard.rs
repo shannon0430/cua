@@ -1858,6 +1858,10 @@ pub(crate) fn dispatch_retained_key_for_owned_fixture(
 }
 
 #[cfg(test)]
+#[path = "premature_focus_fixture.rs"]
+mod premature_focus_fixture;
+
+#[cfg(test)]
 mod virtual_key_scope_tests {
     use super::*;
     use crate::uia::cache::{InputUiaOwnership, InputUiaScopeWitness, KeyboardUiaFocusWitness};

@@ -1,0 +1,176 @@
+name: Issue344 owned no-input preparation ordering proof
+
+on:
+  push:
+    branches: [source/issue344-noinput-preparation-proof-20261012]
+    paths:
+      - libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs
+      - libs/cua-driver/rust/crates/platform-windows/src/input/premature_focus_fixture.rs
+      - .github/workflows/issue344-noinput-preparation-proof.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue344-noinput-preparation-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  owned-noinput-proof:
+    # One initial branch publication only; no automatic rerun or old QA lane.
+    if: github.repository == 'shannon0430/cua' && github.ref == 'refs/heads/source/issue344-noinput-preparation-proof-20261012' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == '1'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '4'
+      RUST_BACKTRACE: '0'
+      CUA_DRIVER_SOURCE_SHA: ${{ github.sha }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/issue344-noinput-target
+      PROOF_DIR: ${{ runner.temp }}/issue344-noinput-preparation-proof
+    steps:
+      - name: Preserve exact source bytes before checkout
+        run: |
+          & git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve source LF bytes' }
+          & git config --global core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve source LF policy' }
+
+      - name: Checkout the exact one-commit candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Bind source and prove unchanged production bodies
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess
+          base='a70d23e106469f9532ad373d6f0a8275380aa704'
+          keyboard='libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs'
+          fixture='libs/cua-driver/rust/crates/platform-windows/src/input/premature_focus_fixture.rs'
+          workflow='.github/workflows/issue344-noinput-preparation-proof.yml'
+          allowed=sorted([keyboard, fixture, workflow])
+          def git(*args): return subprocess.check_output(['git', *args])
+          source=git('rev-parse','HEAD').decode().strip()
+          assert re.fullmatch('[0-9a-f]{40}',source) and source==os.environ['GITHUB_SHA']
+          assert git('rev-parse','HEAD^').decode().strip()==base, 'One exact base descendant required'
+          changed=sorted(git('diff','--name-only',base,'HEAD').decode().splitlines())
+          assert changed==allowed, 'Only two test paths and this workflow may change'
+          include=b'#[cfg(test)]\n#[path = "premature_focus_fixture.rs"]\nmod premature_focus_fixture;\n\n'
+          original=git('show',base+':'+keyboard)
+          current=pathlib.Path(keyboard).read_bytes()
+          assert current.count(include)==1 and current.replace(include,b'')==original
+          assert hashlib.sha256(original).hexdigest()=='f90ed1dad84cd33f9f913b5d75c2bc2faa32a019de1e946525561e4c957f5121'
+          expected={keyboard:'811a4b0355d400b8f290654bd29fb829aa5c8bc0f97ebe879b7714cfe6848e5e',fixture:'5114aef894800491fc8064821dd6f3a6b32b4cf26fc5dd3f574e84d2429d90ab'}
+          rows=[]
+          for path in allowed:
+              data=pathlib.Path(path).read_bytes()
+              assert data==git('show',source+':'+path) and b'\r\n' not in data
+              digest=hashlib.sha256(data).hexdigest()
+              if path in expected: assert digest==expected[path], 'Reviewed test source digest mismatch'
+              rows.append({'path':path,'bytes':len(data),'sha256':digest,'gitBlob':git('rev-parse',source+':'+path).decode().strip()})
+          for path in ['scripts/ci/windows/verify-user-session.ps1','libs/cua-driver/rust/Cargo.lock','libs/cua-driver/rust/rust-toolchain.toml','libs/cua-driver/rust/crates/platform-windows/src/uia/cache.rs']:
+              assert pathlib.Path(path).read_bytes()==git('show',base+':'+path)
+          subprocess.check_call(['git','diff','--check',base,'HEAD'])
+          out=pathlib.Path(os.environ['PROOF_DIR']); out.mkdir(parents=True,exist_ok=False)
+          proof={'sourceCommit':source,'base':base,'runId':os.environ['GITHUB_RUN_ID'],'runAttempt':os.environ['GITHUB_RUN_ATTEMPT'],'job':'owned-noinput-proof','changedPaths':changed,'sourceFiles':rows,'productionBodiesUnchanged':True,'publicWitnessUnchanged':True,'diagnosticFeatureEnabled':False,'canonicalAccepted':False,'tauriCauseEstablished':False,'excelAccepted':False}
+          (out/'source-binding.json').write_text(json.dumps(proof,indent=2)+'\n',encoding='utf-8')
+
+      - name: Verify interactive desktop and pinned native compiler
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\scripts\ci\windows\verify-user-session.ps1 2>&1 | Tee-Object -FilePath (Join-Path $env:PROOF_DIR 'desktop-preflight.log')
+          if (-not $?) { throw 'Interactive user session required; no native fixture skip' }
+          & rustup toolchain install 1.97.1 --profile minimal 2>&1 | Tee-Object -FilePath (Join-Path $env:PROOF_DIR 'toolchain-install.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed' }
+          $compiler = @(& rustc +1.97.1 -vV 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned compiler unavailable' }
+          $compilerText = ($compiler | ForEach-Object { $_.ToString() }) -join "`n"
+          $compiler | Set-Content -Encoding utf8 (Join-Path $env:PROOF_DIR 'compiler.log')
+          if ($compilerText -notmatch 'release: 1\.97\.1' -or $compilerText -notmatch 'host: x86_64-pc-windows-msvc') { throw 'Actual pinned MSVC host required' }
+          [ordered]@{ sourceCommit=$env:GITHUB_SHA; sessionId=(Get-Process -Id $PID).SessionId; rust='1.97.1'; host='x86_64-pc-windows-msvc'; interactiveVerified=$true } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $env:PROOF_DIR 'preconditions.json')
+
+      - name: Compile native library tests only
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & cargo +1.97.1 test --locked -p platform-windows --lib --no-run 2>&1 | Tee-Object -FilePath (Join-Path $env:PROOF_DIR 'native-compile.log')
+          $compileExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($compileExit -ne 0) { throw 'Native test source did not compile' }
+          $binaries = @(Get-ChildItem (Join-Path $env:CARGO_TARGET_DIR 'debug/deps/platform_windows-*.exe'))
+          if ($binaries.Count -ne 1) { throw 'Exactly one fresh native library test binary required' }
+          [ordered]@{ sourceCommit=$env:GITHUB_SHA; compileExitCode=$compileExit; binaryName=$binaries[0].Name; binaryBytes=$binaries[0].Length; binarySha256=(Get-FileHash -Algorithm SHA256 $binaries[0].FullName).Hash.ToLowerInvariant(); sourceStamp=$env:CUA_DRIVER_SOURCE_SHA; compiledNativeTests=$true } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $env:PROOF_DIR 'native-compile.json')
+
+      - name: Run pure guards and one owned no-SendInput fixture
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $results = @()
+          $selected = @(
+            @('input::keyboard::keyboard_focus_witness_tests::production_seam_positive_orders_native_uia_native_then_one_insert', 'stable-positive', $false),
+            @('input::keyboard::keyboard_focus_witness_tests::has_focus_false_refuses_before_sender_or_final_callback', 'semantic-focus-refusal', $false),
+            @('input::keyboard::keyboard_focus_witness_tests::provider_has_focus_true_but_exact_object_differs_refuses', 'exact-object-refusal', $false),
+            @('input::keyboard::keyboard_focus_witness_tests::same_native_root_does_not_admit_foreign_uia_process', 'owner-refusal', $false),
+            @('input::keyboard::premature_focus_fixture::semantic_focus_ready_does_not_replace_the_native_baseline', 'readiness-model', $false),
+            @('input::keyboard::premature_focus_fixture::owned_native_pre_uia_to_final_focus_drift_refuses_without_input', 'owned-native-noinput', $true)
+          )
+          foreach ($selection in $selected) {
+            $testName = $selection[0]
+            $testArguments = @('+1.97.1', 'test', '--locked', '-p', 'platform-windows', '--lib', $testName, '--')
+            if ($selection[2]) { $testArguments += '--ignored' }
+            $testArguments += @('--exact', '--nocapture', '--test-threads=1')
+            $ErrorActionPreference = 'Continue'
+            $testOutput = @(& cargo @testArguments 2>&1)
+            $testExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            $testOutput | Tee-Object -FilePath (Join-Path $env:PROOF_DIR ($selection[1]+'.log')) | Write-Host
+            $testText = ($testOutput | ForEach-Object { $_.ToString() }) -join "`n"
+            $testPrefix = '(?m)^test '+[regex]::Escape($testName)+' \.\.\. '
+            $exactExecutionCount = [regex]::Matches($testText, $testPrefix+'(?:ok|FAILED|ignored(?:,.*)?)\r?$').Count
+            $exactPassMarkerCount = [regex]::Matches($testText, $testPrefix+'ok\r?$').Count
+            $passed = $testExit -eq 0 -and $testText -match 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -and $exactExecutionCount -eq 1 -and $exactPassMarkerCount -eq 1
+            $results += [ordered]@{ test=$testName; scope=$selection[1]; exactExecutionCount=$exactExecutionCount; exactPassMarkerCount=$exactPassMarkerCount; exitCode=$testExit; passed=$passed; noKeyboardActuator=$true }
+            [ordered]@{ sourceCommit=$env:GITHUB_SHA; results=$results; allSixPassed=($results.Count -eq 6 -and @($results | Where-Object { -not $_.passed }).Count -eq 0); nativeFixtureExecuted=($selection[2] -and $passed); binaryIdentityVerified=$false; rootCauseEstablished=$false; canonicalAccepted=$false; excelAccepted=$false } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $env:PROOF_DIR 'test-results.json')
+            if (-not $passed) { throw 'Exact source proof test failed, missing, duplicated, or ignored' }
+          }
+          $finalBinary = @(Get-ChildItem (Join-Path $env:CARGO_TARGET_DIR 'debug/deps/platform_windows-*.exe'))
+          $compiled = Get-Content -Raw (Join-Path $env:PROOF_DIR 'native-compile.json') | ConvertFrom-Json
+          if ($finalBinary.Count -ne 1 -or (Get-FileHash -Algorithm SHA256 $finalBinary[0].FullName).Hash.ToLowerInvariant() -ne $compiled.binarySha256) { throw 'Executed binary identity changed after compile' }
+          $finalResults = Get-Content -Raw (Join-Path $env:PROOF_DIR 'test-results.json') | ConvertFrom-Json
+          $finalResults.binaryIdentityVerified = $true
+          $finalResults | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $env:PROOF_DIR 'test-results.json')
+
+      - name: Freeze bounded proof files even on failure
+        if: always()
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib
+          out=pathlib.Path(os.environ['PROOF_DIR']); out.mkdir(parents=True,exist_ok=True)
+          rows=[]; total=0
+          for path in sorted(out.iterdir()):
+              if not path.is_file() or path.name=='proof-manifest.json': continue
+              data=path.read_bytes(); assert len(data)<=16*1024*1024, 'Proof file exceeds bounded log budget'
+              total+=len(data); rows.append({'path':path.name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          assert total<=64*1024*1024, 'Proof collection exceeds bounded job evidence budget'
+          def load(name):
+              path=out/name
+              return json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
+          source=load('source-binding.json'); compiled=load('native-compile.json'); tests=load('test-results.json')
+          complete=bool(source.get('productionBodiesUnchanged') and compiled.get('compiledNativeTests') and tests.get('allSixPassed') and tests.get('nativeFixtureExecuted') and tests.get('binaryIdentityVerified') and source.get('sourceCommit')==os.environ['GITHUB_SHA']==compiled.get('sourceCommit')==tests.get('sourceCommit'))
+          proof={'schema':'cua-owned-noinput-preparation-proof/v1','sourceCommit':os.environ['GITHUB_SHA'],'base':'a70d23e106469f9532ad373d6f0a8275380aa704','runId':os.environ['GITHUB_RUN_ID'],'runAttempt':os.environ['GITHUB_RUN_ATTEMPT'],'job':'owned-noinput-proof','proofComplete':complete,'files':rows,'totalBytes':total,'nativeActuator':'fake insertion counter only; reviewed source path has no SendInput','rootCauseEstablished':False,'canonicalAccepted':False,'tauriAccepted':False,'excelAccepted':False,'packageBuilt':False,'liveActivated':False}
+          (out/'proof-manifest.json').write_text(json.dumps(proof,indent=2)+'\n',encoding='utf-8')
+
+      - name: Retain source-bound diagnostic proof only
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: issue344-owned-noinput-preparation-proof
+          path: ${{ runner.temp }}/issue344-noinput-preparation-proof
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
