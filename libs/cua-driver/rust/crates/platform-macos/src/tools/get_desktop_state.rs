@@ -128,6 +128,7 @@ impl Tool for GetDesktopStateTool {
             is_error: None,
             structured_content: Some(structured),
             action_record: None,
+            native_action_lifecycle: None,
         }
     }
 }

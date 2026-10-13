@@ -1637,6 +1637,7 @@ impl Tool for GetWindowStateTool {
                     is_error: None,
                     structured_content: Some(structured),
                     action_record: None,
+                    native_action_lifecycle: None,
                 }
             }
             Err(e) => ToolResult::error(format!("Error: {e}")),
@@ -3038,6 +3039,39 @@ fn background_element_click_result(
         .with_action_record(record)
 }
 
+fn foreground_click_result(
+    message: String,
+    path: &str,
+    outcome: crate::input::mouse::SynthesizedClickOutcome,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        EvidenceKind, RequestedDelivery,
+    };
+    let transition = outcome.target_transition.as_str();
+    let native_transition = match outcome.target_transition {
+        crate::input::mouse::ClickTargetTransition::Retained => {
+            cua_driver_core::protocol::NativeTargetTransition::Retained
+        }
+        crate::input::mouse::ClickTargetTransition::Destroyed => {
+            cua_driver_core::protocol::NativeTargetTransition::Destroyed
+        }
+    };
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable, ActionTransport::WindowsSendInput, RequestedDelivery::Foreground,
+    ).actual_delivery(ActualDelivery::Foreground)
+        .delivered_count(outcome.delivered_count)
+        .evidence(ActionEvidence { kind: EvidenceKind::NativeApiResult,
+            detail: "SendInput accepted every requested modifier and pointer event".into() })
+        .evidence(ActionEvidence { kind: EvidenceKind::WindowChange, detail: transition.into() })
+        .detail("target lifecycle is observed after dispatch; application command effect and persistence are not verified")
+        .build().expect("foreground click evidence is valid");
+    ToolResult::text(message)
+        .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" }))
+        .with_native_target_transition(native_transition)
+        .with_action_record(record)
+}
+
 pub struct ClickTool {
     state: Arc<ToolState>,
 }
@@ -3195,26 +3229,24 @@ impl Tool for ClickTool {
             // Click the HWND that owned the pixel before the driver overlay
             // moved there. The active SendInput path performs the foreground
             // swap and UIPI checks needed for Chromium and retained-mode apps.
-            let send_result = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let send_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let mod_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::send_click_synthesized_active_mods(
+                let outcome = crate::input::send_click_synthesized_active_mods_with_outcome(
                     hwnd_u, sx, sy, count, &button, &mod_refs,
                 )?;
-                Ok(hwnd_u)
+                Ok((hwnd_u, outcome))
             })
             .await;
             return match send_result {
-                Ok(Ok(hwnd_u)) => {
+                Ok(Ok((hwnd_u, outcome))) => {
                     let click_word = match count {
                         2 => "double-click",
                         3 => "triple-click",
                         _ => "click",
                     };
-                    ToolResult::text(format!(
-                        "✅ Sent {click_word} via SendInput at screen ({sx},{sy}) on HWND 0x{hwnd_u:x} (desktop scope)."
-                    ))
-                    // SendInput dispatched but is not driver-verifiable (no read-back).
-                    .with_structured(json!({ "path": "pixel", "verified": false, "effect": "unverifiable" }))
+                    foreground_click_result(format!(
+                        "Sent {click_word} via SendInput at screen ({sx},{sy}) on HWND 0x{hwnd_u:x} (desktop scope)."
+                    ), "pixel", outcome)
                 }
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -3411,13 +3443,15 @@ impl Tool for ClickTool {
                         let _admission = &admitted;
                         let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                         if activate {
-                            crate::input::send_click_synthesized_active_mods(
+                            crate::input::send_click_synthesized_active_mods_with_outcome(
                                 hwnd, tx, ty, count, &btn_fg, &mod_refs,
                             )
+                            .map(Some)
                         } else {
                             crate::input::send_click_synthesized_mods(
                                 hwnd, tx, ty, count, &btn_fg, &mod_refs,
                             )
+                            .map(|_| None)
                         }
                     }
                 })
@@ -3425,7 +3459,12 @@ impl Tool for ClickTool {
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 let half = if want_expand { "dropdown" } else { "press" };
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok(Ok(Some(outcome))) => foreground_click_result(
+                        format!("Sent SendInput click on MSAA [{idx}] {half} half at ({tx},{ty})."),
+                        "msaa",
+                        outcome,
+                    ),
+                    Ok(Ok(None)) => ToolResult::text(format!(
                         "✅ Performed SendInput click on MSAA [{idx}] {half} half at ({tx},{ty})."
                     ))
                     .with_structured(
@@ -3574,7 +3613,7 @@ impl Tool for ClickTool {
                     move || {
                         let _admission = &admitted;
                         let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        crate::input::send_click_synthesized_active_mods(
+                        crate::input::send_click_synthesized_active_mods_with_outcome(
                             hwnd, cx, cy, count, &btn_fg, &mod_refs,
                         )
                     }
@@ -3582,10 +3621,9 @@ impl Tool for ClickTool {
                 .await;
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
-                        "✅ Performed SendInput click on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
-                    ))
-                    .with_structured(json!({ "path": "pixel", "verified": false, "effect": "unverifiable" })),
+                    Ok(Ok(outcome)) => foreground_click_result(format!(
+                        "Sent SendInput click on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
+                    ), "pixel", outcome),
                     Ok(Err(e)) => ToolResult::error(e.to_string()),
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
                 };
@@ -3920,7 +3958,7 @@ impl Tool for ClickTool {
                     move || {
                         let _admission = &admitted;
                         let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        crate::input::send_click_synthesized_active_mods(
+                        crate::input::send_click_synthesized_active_mods_with_outcome(
                             hwnd, sx as i32, sy as i32, count, &btn, &mod_refs,
                         )
                     }
@@ -3928,16 +3966,15 @@ impl Tool for ClickTool {
                 .await;
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(outcome)) => {
                         let click_word = match count {
                             2 => "double-click",
                             3 => "triple-click",
                             _ => "click",
                         };
-                        ToolResult::text(format!(
-                            "✅ Sent {click_word} via SendInput to pid {pid} at ({sx},{sy}) (delivery_mode:foreground)."
-                        ))
-                        .with_structured(json!({ "path": "pixel", "verified": false, "effect": "unverifiable" }))
+                        foreground_click_result(format!(
+                            "Sent {click_word} via SendInput to pid {pid} at ({sx},{sy}) (delivery_mode:foreground)."
+                        ), "pixel", outcome)
                     }
                     Ok(Err(e)) => ToolResult::error(e.to_string()),
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -7897,6 +7934,7 @@ impl Tool for GetDesktopStateTool {
             is_error: None,
             structured_content: Some(structured),
             action_record: None,
+            native_action_lifecycle: None,
         }
     }
 }
@@ -8849,6 +8887,7 @@ impl Tool for ZoomTool {
                         "mime_type": "image/jpeg"
                     })),
                     action_record: None,
+                    native_action_lifecycle: None,
                 }
             }
             Ok(Err(e)) => ToolResult::error(format!("Zoom failed: {e}")),
@@ -10743,5 +10782,45 @@ mod value_write_readback_tests {
             classify_value_write_readback(Some("unchanged"), "unchanged", "unchanged"),
             "pending"
         );
+    }
+}
+
+#[cfg(test)]
+mod foreground_click_outcome_projection_tests {
+    use super::*;
+    #[test]
+    fn destroyed_target_remains_unverifiable_and_separate_from_delivery_count() {
+        let result = foreground_click_result(
+            "sent".into(),
+            "pixel",
+            crate::input::mouse::SynthesizedClickOutcome {
+                delivered_count: 3,
+                target_transition: crate::input::mouse::ClickTargetTransition::Destroyed,
+            },
+        );
+        assert_eq!(
+            result.action_record.as_ref().unwrap().delivered_count,
+            Some(3)
+        );
+        let lifecycle = serde_json::to_value(result.native_action_lifecycle).unwrap();
+        assert_eq!(lifecycle["targetTransition"], "target_destroyed");
+        let projection = result.structured_content.unwrap();
+        assert_eq!(projection["effect"], "unverifiable");
+        assert_eq!(projection["verified"], false);
+    }
+    #[test]
+    fn retained_dialog_never_becomes_close_confirmation() {
+        let result = foreground_click_result(
+            "sent".into(),
+            "pixel",
+            crate::input::mouse::SynthesizedClickOutcome {
+                delivered_count: 3,
+                target_transition: crate::input::mouse::ClickTargetTransition::Retained,
+            },
+        );
+        let lifecycle = serde_json::to_value(result.native_action_lifecycle).unwrap();
+        assert_eq!(lifecycle["targetTransition"], "target_retained");
+        let projection = result.structured_content.unwrap();
+        assert_eq!(projection["effect"], "unverifiable");
     }
 }

@@ -3416,3 +3416,31 @@ mod tests {
         panic!("remote request cancellation was not forwarded");
     }
 }
+
+#[cfg(test)]
+mod native_action_lifecycle_raw_normalization_tests {
+    use super::*;
+    #[test]
+    fn existing_ffi_result_retains_native_lifecycle_in_raw_json_only() {
+        let raw = serde_json::json!({
+            "content":[{"type":"text","text":"sent"}],
+            "nativeActionLifecycle":{"targetTransition":"target_destroyed"},
+            "structuredContent":{"effect":"unverifiable","route":"global_input","delivery":{"mode":"foreground","delivered_count":3},"evidence":[{"kind":"window_change"}]}
+        });
+        let result = normalize_result("click", raw.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.raw_json).unwrap()["nativeActionLifecycle"],
+            raw["nativeActionLifecycle"]
+        );
+        let action = result.action.unwrap();
+        assert_eq!(
+            action.effect,
+            cua_driver_contract::ActionEffect::Unverifiable
+        );
+        assert_eq!(action.delivery.unwrap().delivered_count, Some(3));
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.structured_json.unwrap()).unwrap(),
+            raw["structuredContent"]
+        );
+    }
+}
