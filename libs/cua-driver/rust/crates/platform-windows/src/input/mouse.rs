@@ -585,7 +585,10 @@ fn classify_click_postcondition(
             "input_delivery_incomplete: lifecycle observation cannot prove missing input delivery"
         );
     }
-    if !target_exists && current.is_none() {
+    // The exact identity probe precedes the final IsWindow probe. An original
+    // identity observed earlier may legitimately disappear between those
+    // observations. A different identity is never converted into destruction.
+    if !target_exists && (current.is_none() || current == Some(expected)) {
         return Ok(ClickTargetTransition::Destroyed);
     }
     if !target_exists || current != Some(expected) || !lifetime_retained {
@@ -869,21 +872,25 @@ fn send_click_synthesized_mods_impl(
         }
         if activate {
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-            let current = capture_click_target_identity(target);
-            let target_exists = IsWindow(target).as_bool();
             let actual = GetForegroundWindow();
+            let foreground_allowed = crate::win32::foreground_matches_target_or_owned_window(
+                foreground_target.expect("foreground target captured before input"),
+                actual.0 as usize as u64,
+            );
+            let current = capture_click_target_identity(target);
+            let lifetime_retained = click_lifetime
+                .as_ref()
+                .expect("click lifetime marker")
+                .retained();
+            // Probe existence last: a Close that completes during an earlier
+            // identity/foreground/property probe must not become a false error.
+            let target_exists = IsWindow(target).as_bool();
             target_transition = classify_click_postcondition(
                 click_identity.expect("exact click identity captured before input"),
                 target_exists,
                 current,
-                crate::win32::foreground_matches_target_or_owned_window(
-                    foreground_target.expect("foreground target captured before input"),
-                    actual.0 as usize as u64,
-                ),
-                click_lifetime
-                    .as_ref()
-                    .expect("click lifetime marker")
-                    .retained(),
+                foreground_allowed,
+                lifetime_retained,
                 sent_ok,
             )?;
         }
@@ -1404,13 +1411,24 @@ mod click_target_lifecycle_tests {
         assert!(classify_click_postcondition(original(), true, None, true, true, true).is_err());
     }
     #[test]
-    fn inconsistent_destroyed_observation_is_refused() {
+    fn original_destroyed_during_sequential_probe_is_not_a_false_identity_failure() {
+        assert_eq!(
+            classify_click_postcondition(original(), false, Some(original()), false, false, true)
+                .unwrap(),
+            ClickTargetTransition::Destroyed
+        );
+    }
+    #[test]
+    fn different_identity_then_gone_is_not_relabelled_original_destruction() {
         assert!(classify_click_postcondition(
             original(),
             false,
-            Some(original()),
-            true,
-            true,
+            Some(ClickTargetIdentity {
+                pid: 8,
+                ..original()
+            }),
+            false,
+            false,
             true
         )
         .is_err());

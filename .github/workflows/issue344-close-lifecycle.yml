@@ -18,7 +18,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: '4'
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-      VERSION: 0.28.2-kanon.20261014.1
+      VERSION: 0.28.2-kanon.20261014.2
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -60,7 +60,7 @@ jobs:
               if (-not $summary.Success -or [int]$summary.Groups[1].Value -ne $expected -or [int]$summary.Groups[2].Value -ne 0 -or [int]$summary.Groups[3].Value -ne 0) { throw "$label did not execute exactly $expected passing cases" }
             }
           }
-          Run-Cargo 'lifecycle-regressions' @('test','--locked','-p','platform-windows','--lib','click_target_lifecycle_tests::','--','--test-threads=1') 9
+          Run-Cargo 'lifecycle-regressions' @('test','--locked','-p','platform-windows','--lib','click_target_lifecycle_tests::','--','--test-threads=1') 10
           Run-Cargo 'identity-delivery-regressions' @('test','--locked','-p','platform-windows','--lib','click_lifetime_delivery_tests::','--','--test-threads=1') 3
           Run-Cargo 'outcome-projection-regressions' @('test','--locked','-p','platform-windows','--lib','foreground_click_outcome_projection_tests::','--','--test-threads=1') 2
           Run-Cargo 'core-lifecycle-wire' @('test','--locked','-p','cua-driver-core','--lib','native_action_lifecycle_wire_tests::','--','--test-threads=1') 2
