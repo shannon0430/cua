@@ -448,7 +448,7 @@ pub fn send_click_synthesized_mods(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    send_click_synthesized_mods_impl(target, sx, sy, count, button, modifiers, false)
+    send_click_synthesized_mods_impl(target, sx, sy, count, button, modifiers, false).map(|_| ())
 }
 
 /// SendInput click for an explicit foreground request. Unlike the historical
@@ -463,6 +463,152 @@ pub fn send_click_synthesized_active_mods(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
+    send_click_synthesized_active_mods_with_outcome(target, sx, sy, count, button, modifiers)
+        .map(|_| ())
+}
+
+/// Input delivery and post-dispatch target lifecycle are independent evidence.
+/// Neither observation proves that the application's intended command ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClickTargetTransition {
+    Retained,
+    Destroyed,
+}
+
+impl ClickTargetTransition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retained => "target_retained",
+            Self::Destroyed => "target_destroyed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SynthesizedClickOutcome {
+    pub delivered_count: u32,
+    pub target_transition: ClickTargetTransition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClickTargetIdentity {
+    pid: u32,
+    thread_id: u32,
+    process_creation: u64,
+}
+
+fn capture_click_target_identity(hwnd: HWND) -> Option<ClickTargetIdentity> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if thread_id == 0 || pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let (mut creation, mut exit, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    let read = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let _ = unsafe { CloseHandle(handle) };
+    read.ok()?;
+    let mut checked_pid = 0;
+    let checked_thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut checked_pid)) };
+    if checked_pid != pid || checked_thread != thread_id {
+        return None;
+    }
+    Some(ClickTargetIdentity {
+        pid,
+        thread_id,
+        process_creation: ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64,
+    })
+}
+
+// Win32 removes all properties when a window is destroyed. A unique temporary
+// marker therefore detects same-thread HWND reuse that PID/birth alone cannot.
+// No application data is read; Drop removes only our own still-present marker.
+struct ClickWindowLifetime {
+    hwnd: HWND,
+    name: Vec<u16>,
+}
+impl ClickWindowLifetime {
+    fn capture(hwnd: HWND) -> Result<Self> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::WindowsAndMessaging::SetPropW;
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| {
+            anyhow::anyhow!(
+            "target_identity_unavailable: window marker randomness failed; no mouse input was sent"
+        )
+        })?;
+        let name: Vec<u16> = format!("cua-driver-click-{nonce:x?}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe { SetPropW(hwnd, PCWSTR(name.as_ptr()), HANDLE(1usize as *mut _)) }
+            .context("target_identity_unavailable: window lifetime marker unavailable; no mouse input was sent")?;
+        Ok(Self { hwnd, name })
+    }
+    fn retained(&self) -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+        unsafe { GetPropW(self.hwnd, PCWSTR(self.name.as_ptr())).0 as usize == 1 }
+    }
+}
+impl Drop for ClickWindowLifetime {
+    fn drop(&mut self) {
+        if self.retained() {
+            use windows::core::PCWSTR;
+            use windows::Win32::UI::WindowsAndMessaging::RemovePropW;
+            let _ = unsafe { RemovePropW(self.hwnd, PCWSTR(self.name.as_ptr())) };
+        }
+    }
+}
+
+fn classify_click_postcondition(
+    expected: ClickTargetIdentity,
+    target_exists: bool,
+    current: Option<ClickTargetIdentity>,
+    foreground_allowed: bool,
+    lifetime_retained: bool,
+    input_complete: bool,
+) -> Result<ClickTargetTransition> {
+    if !input_complete {
+        bail!(
+            "input_delivery_incomplete: lifecycle observation cannot prove missing input delivery"
+        );
+    }
+    if !target_exists && current.is_none() {
+        return Ok(ClickTargetTransition::Destroyed);
+    }
+    if !target_exists || current != Some(expected) || !lifetime_retained {
+        bail!(
+            "target_identity_changed: original click target could not be verified after dispatch"
+        );
+    }
+    if !foreground_allowed {
+        bail!("foreground_unavailable: surviving click target or verified owned window was not foreground after dispatch");
+    }
+    Ok(ClickTargetTransition::Retained)
+}
+
+/// Witnessed explicit-foreground click. A destroyed original target does not
+/// have to remain foreground; a live/replaced target is never exempted.
+pub fn send_click_synthesized_active_mods_with_outcome(
+    target: u64,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+) -> Result<SynthesizedClickOutcome> {
     send_click_synthesized_mods_impl(target, sx, sy, count, button, modifiers, true)
 }
 
@@ -474,7 +620,7 @@ fn send_click_synthesized_mods_impl(
     button: &str,
     modifiers: &[&str],
     activate: bool,
-) -> Result<()> {
+) -> Result<SynthesizedClickOutcome> {
     let target = HWND(target as *mut _);
     if target.0.is_null() {
         bail!("invalid target hwnd");
@@ -557,6 +703,8 @@ fn send_click_synthesized_mods_impl(
         },
     };
 
+    let mut delivered_count = 0;
+    let mut target_transition = ClickTargetTransition::Retained;
     unsafe {
         // Save previous foreground + cursor position so we can restore.
         let prev_fg = GetForegroundWindow();
@@ -597,6 +745,19 @@ fn send_click_synthesized_mods_impl(
         } else {
             None
         };
+        let click_identity = if activate {
+            Some(
+                capture_click_target_identity(target)
+                    .context("target_identity_unavailable: no mouse input was sent")?,
+            )
+        } else {
+            None
+        };
+        let click_lifetime = if activate {
+            Some(ClickWindowLifetime::capture(target)?)
+        } else {
+            None
+        };
         let noactivate = (!activate).then(|| crate::input::NoActivateGuard::arm(target));
         if !activate {
             let _ = SetWindowPos(
@@ -623,12 +784,22 @@ fn send_click_synthesized_mods_impl(
         let mut sent_ok = true;
         if !mod_downs.is_empty() {
             let sent = SendInput(&mod_downs, std::mem::size_of::<INPUT>() as i32);
+            delivered_count += sent;
             sent_ok = sent as usize == mod_downs.len();
             sleep(Duration::from_millis(5));
         }
 
         let count = count.max(1);
         for i in 0..count {
+            if activate
+                && (capture_click_target_identity(target) != click_identity
+                    || !click_lifetime
+                        .as_ref()
+                        .expect("click lifetime marker")
+                        .retained())
+            {
+                sent_ok = false;
+            }
             if !sent_ok {
                 break;
             }
@@ -637,6 +808,7 @@ fn send_click_synthesized_mods_impl(
             // them can prevent retained-mode controls from seeing the press.
             let events = [move_input, down_input, up_input];
             let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+            delivered_count += sent;
             if sent as usize != events.len() {
                 sent_ok = false;
                 break;
@@ -649,6 +821,7 @@ fn send_click_synthesized_mods_impl(
         // Release any held modifiers (reverse order) before restoring z-order.
         if !mod_ups.is_empty() {
             let released = SendInput(&mod_ups, std::mem::size_of::<INPUT>() as i32);
+            delivered_count += released;
             if released as usize != mod_ups.len() {
                 // A second release attempt is safe and reduces the chance of a
                 // partially inserted chord leaving system modifier state held.
@@ -695,23 +868,31 @@ fn send_click_synthesized_mods_impl(
             );
         }
         if activate {
+            use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+            let current = capture_click_target_identity(target);
+            let target_exists = IsWindow(target).as_bool();
             let actual = GetForegroundWindow();
-            if !crate::win32::foreground_matches_target_or_owned_window(
-                foreground_target.expect("foreground target captured before input"),
-                actual.0 as usize as u64,
-            ) {
-                bail!(
-                    "foreground_unavailable: exact target HWND {:?} or a verified same-process \
-                     post-action window was not foreground after the click \
-                     (actual foreground HWND {:?})",
-                    target.0,
-                    actual.0
-                );
-            }
+            target_transition = classify_click_postcondition(
+                click_identity.expect("exact click identity captured before input"),
+                target_exists,
+                current,
+                crate::win32::foreground_matches_target_or_owned_window(
+                    foreground_target.expect("foreground target captured before input"),
+                    actual.0 as usize as u64,
+                ),
+                click_lifetime
+                    .as_ref()
+                    .expect("click lifetime marker")
+                    .retained(),
+                sent_ok,
+            )?;
         }
     }
 
-    Ok(())
+    Ok(SynthesizedClickOutcome {
+        delivered_count,
+        target_transition,
+    })
 }
 
 /// Press-hold-move-release drag via `SendInput`. Companion to
@@ -1124,5 +1305,239 @@ mod wheel_tests {
     #[test]
     fn wheel_data_zero_is_zero() {
         assert_eq!(wheel_mouse_data(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod click_target_lifecycle_tests {
+    use super::*;
+    fn original() -> ClickTargetIdentity {
+        ClickTargetIdentity {
+            pid: 7,
+            thread_id: 9,
+            process_creation: 11,
+        }
+    }
+    #[test]
+    fn destroyed_target_accepts_unrelated_foreground_without_claiming_effect() {
+        assert_eq!(
+            classify_click_postcondition(original(), false, None, false, false, true).unwrap(),
+            ClickTargetTransition::Destroyed
+        );
+    }
+    #[test]
+    fn destroyed_target_accepts_absent_foreground() {
+        assert_eq!(
+            classify_click_postcondition(original(), false, None, false, false, true)
+                .unwrap()
+                .as_str(),
+            "target_destroyed"
+        );
+    }
+    #[test]
+    fn surviving_original_requires_foreground() {
+        assert!(classify_click_postcondition(
+            original(),
+            true,
+            Some(original()),
+            false,
+            true,
+            true
+        )
+        .is_err());
+    }
+    #[test]
+    fn surviving_owned_dialog_is_not_destroyed_or_close_confirmed() {
+        assert_eq!(
+            classify_click_postcondition(original(), true, Some(original()), true, true, true)
+                .unwrap(),
+            ClickTargetTransition::Retained
+        );
+    }
+    #[test]
+    fn replaced_pid_is_refused_even_with_allowed_foreground() {
+        assert!(classify_click_postcondition(
+            original(),
+            true,
+            Some(ClickTargetIdentity {
+                pid: 8,
+                ..original()
+            }),
+            true,
+            true,
+            true
+        )
+        .is_err());
+    }
+    #[test]
+    fn reused_pid_with_new_process_birth_is_refused() {
+        assert!(classify_click_postcondition(
+            original(),
+            true,
+            Some(ClickTargetIdentity {
+                process_creation: 12,
+                ..original()
+            }),
+            true,
+            true,
+            true
+        )
+        .is_err());
+    }
+    #[test]
+    fn changed_window_thread_is_refused() {
+        assert!(classify_click_postcondition(
+            original(),
+            true,
+            Some(ClickTargetIdentity {
+                thread_id: 10,
+                ..original()
+            }),
+            true,
+            true,
+            true
+        )
+        .is_err());
+    }
+    #[test]
+    fn failed_identity_read_is_not_destruction() {
+        assert!(classify_click_postcondition(original(), true, None, true, true, true).is_err());
+    }
+    #[test]
+    fn inconsistent_destroyed_observation_is_refused() {
+        assert!(classify_click_postcondition(
+            original(),
+            false,
+            Some(original()),
+            true,
+            true,
+            true
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod click_lifetime_delivery_tests {
+    use super::*;
+    #[test]
+    fn same_thread_same_process_reused_hwnd_is_refused() {
+        let id = ClickTargetIdentity {
+            pid: 7,
+            thread_id: 9,
+            process_creation: 11,
+        };
+        assert!(classify_click_postcondition(id, true, Some(id), true, false, true).is_err());
+    }
+    #[test]
+    fn destroyed_target_does_not_mask_partial_input() {
+        let id = ClickTargetIdentity {
+            pid: 7,
+            thread_id: 9,
+            process_creation: 11,
+        };
+        assert!(classify_click_postcondition(id, false, None, false, false, false).is_err());
+    }
+    #[test]
+    fn destroyed_target_does_not_mask_zero_input() {
+        let id = ClickTargetIdentity {
+            pid: 7,
+            thread_id: 9,
+            process_creation: 11,
+        };
+        assert!(classify_click_postcondition(id, false, None, true, false, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod click_owned_destroyed_fixture_tests {
+    use super::*;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LRESULT, RECT};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+        GetMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, UnregisterClassW, MSG,
+        WINDOW_EX_STYLE, WM_LBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+    unsafe extern "system" fn fixture_proc(
+        hwnd: HWND,
+        message: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> LRESULT {
+        if message == WM_LBUTTONUP {
+            let _ = DestroyWindow(hwnd);
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, message, wp, lp)
+    }
+    #[test]
+    #[ignore = "Requires an exclusive owned interactive Windows desktop"]
+    fn production_sendinput_observes_original_target_destroyed() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || unsafe {
+            let name: Vec<u16> = format!("CuaOwnedClickDestroy{}", std::process::id())
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(fixture_proc),
+                hInstance: instance.into(),
+                lpszClassName: PCWSTR(name.as_ptr()),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                PCWSTR(name.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                180,
+                180,
+                400,
+                260,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect).unwrap();
+            let mut point = POINT {
+                x: (rect.right - rect.left) / 2,
+                y: (rect.bottom - rect.top) / 2,
+            };
+            assert!(ClientToScreen(hwnd, &mut point).as_bool());
+            tx.send((hwnd.0 as usize as u64, point.x, point.y)).unwrap();
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            UnregisterClassW(PCWSTR(name.as_ptr()), instance).unwrap();
+        });
+        let (hwnd, x, y) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = send_click_synthesized_active_mods_with_outcome(hwnd, x, y, 1, "left", &[]);
+        if result.is_err() {
+            // Release only our own fixture so a failed test cannot hang its worker.
+            use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+            let _ = unsafe { PostMessageW(HWND(hwnd as *mut _), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            // Default WM_CLOSE destroys the HWND but does not quit this fixture's loop.
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowThreadProcessId, PostThreadMessageW, WM_QUIT,
+            };
+            let tid = unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), None) };
+            if tid != 0 {
+                let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
+            }
+        }
+        let outcome = result.unwrap();
+        assert_eq!(outcome.delivered_count, 3);
+        assert_eq!(outcome.target_transition, ClickTargetTransition::Destroyed);
+        thread.join().unwrap();
     }
 }

@@ -1,0 +1,119 @@
+name: Issue344 official0.28.2 Close lifecycle repair packages
+on:
+  push:
+    branches: [source/issue344-close-official-lifecycle-20261014]
+permissions:
+  contents: read
+concurrency:
+  group: issue344-close-lifecycle-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    if: github.repository == 'shannon0430/cua' && github.ref == 'refs/heads/source/issue344-close-official-lifecycle-20261014'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '4'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      VERSION: 0.28.2-kanon.20261014.1
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+      - name: Initialize exact native source and scope proof
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'close-lifecycle-artifact'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          "QA_OUT=$out" >> $env:GITHUB_ENV
+          "CARGO_HOME=$(Join-Path $env:RUNNER_TEMP 'close-cargo')" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'close-target')" >> $env:GITHUB_ENV
+          $proof = [ordered]@{ sourceCommit=$env:GITHUB_SHA; repository=$env:GITHUB_REPOSITORY; runId=$env:GITHUB_RUN_ID; runAttempt=$env:GITHUB_RUN_ATTEMPT; baseCommit='36987990b292537770fe2df3a9e6dee2ef43db2f'; packageVersion=$env:VERSION; customerInput=$false; productionDeployment=$false; scope='official0.28.2 native click lifecycle and synthetic owned fixture only' }
+          $proof | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $out 'source-scope.json')
+          & git diff --check HEAD^
+          if ($LASTEXITCODE -ne 0) { throw 'Source whitespace check failed' }
+          & rustup toolchain install 1.97.1 --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust install failed' }
+          & rustfmt +1.97.1 --edition 2021 --check libs/cua-driver/rust/crates/platform-windows/src/input/mouse.rs libs/cua-driver/rust/crates/platform-windows/src/input/mod.rs libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Rust formatting failed' }
+      - name: Native regressions and owned production-click fixture
+        working-directory: libs/cua-driver/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Run-Cargo([string]$label,[string[]]$arguments) {
+            $ErrorActionPreference = 'Continue'
+            & cargo +1.97.1 @arguments 2>&1 | Tee-Object -FilePath (Join-Path $env:QA_OUT "$label.log")
+            $code=$LASTEXITCODE
+            if ($code -ne 0) { throw "$label failed with exit $code" }
+          }
+          Run-Cargo 'lifecycle-regressions' @('test','--locked','-p','platform-windows','--lib','click_target_lifecycle_tests::','--','--test-threads=1')
+          Run-Cargo 'identity-delivery-regressions' @('test','--locked','-p','platform-windows','--lib','click_lifetime_delivery_tests::','--','--test-threads=1')
+          Run-Cargo 'outcome-projection-regressions' @('test','--locked','-p','platform-windows','--lib','foreground_click_outcome_projection_tests::','--','--test-threads=1')
+          $session=(Get-Process -Id $PID).SessionId
+          if ($session -eq 0) { throw 'Owned interactive fixture cannot run in Session0' }
+          Run-Cargo 'owned-destroyed-click' @('test','--locked','-p','platform-windows','--lib','click_owned_destroyed_fixture_tests::','--','--ignored','--test-threads=1')
+          Run-Cargo 'sdk-abi' @('test','--locked','-p','cua-driver-sdk','--lib','abi::tests::','--','--test-threads=1')
+          Run-Cargo 'release-build' @('build','--locked','-p','cua-driver-sdk','--release','--target','x86_64-pc-windows-msvc')
+      - name: Canonical versioned SDK and Windows package assembly
+        run: |
+          $ErrorActionPreference='Stop'
+          $native=Join-Path $env:QA_OUT 'native/win32-x64-msvc'
+          $official=Join-Path $env:QA_OUT 'official'
+          $packages=Join-Path $env:QA_OUT 'packages'
+          New-Item -ItemType Directory -Force $native,$official,$packages | Out-Null
+          & npm pack '@trycua/cua-driver-win32-x64-msvc@0.28.2' --ignore-scripts --json --pack-destination $official | Set-Content -Encoding utf8 (Join-Path $env:QA_OUT 'official-pack-receipt.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Official addon provenance acquisition failed' }
+          $tar=Join-Path $official 'trycua-cua-driver-win32-x64-msvc-0.28.2.tgz'
+          if ((Get-FileHash -Algorithm SHA256 $tar).Hash.ToLowerInvariant() -ne '731a3e5d7307ea535a74df4dca806826b9b53a723b3f137ecf7d940f585b982a') { throw 'Accepted official provenance tar changed' }
+          & tar -xf $tar -C $official
+          if ($LASTEXITCODE -ne 0) { throw 'Official native tar extraction failed' }
+          $addon=Join-Path $official 'package/cua_driver_node_runtime.node'
+          if ((Get-FileHash -Algorithm SHA256 $addon).Hash.ToLowerInvariant() -ne '93f220e8a5cbf25aff23321f20a868368a204f1026b8dce45c5a4f84290de09f') { throw 'Accepted official addon bytes changed' }
+          Copy-Item $addon (Join-Path $native 'cua_driver_node_runtime.node')
+          Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/cua_driver_sdk.dll') (Join-Path $native 'cua_driver_sdk.dll')
+          Push-Location libs/cua-driver/typescript
+          try {
+            & npm ci --ignore-scripts --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw 'Frozen SDK dependency installation failed' }
+            & npm run build
+            if ($LASTEXITCODE -ne 0) { throw 'Source SDK build failed' }
+          } finally { Pop-Location }
+          & node libs/cua-driver/scripts/build-npm-packages.mjs --version $env:VERSION --native-dir (Split-Path $native) --output-dir $packages --allow-partial --missing-platform-version 0.28.2
+          if ($LASTEXITCODE -ne 0) { throw 'Normal versioned package assembly failed' }
+          $hashes = Get-ChildItem -Recurse -File $packages,$native | ForEach-Object { [ordered]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()} }
+          @($hashes) | ConvertTo-Json -Depth 4 -AsArray | Set-Content -Encoding utf8 (Join-Path $env:QA_OUT 'package-artifact-hashes.json')
+      - name: Fresh normal local-tar package install and SDK ABI import
+        run: |
+          $ErrorActionPreference='Stop'
+          $smoke=Join-Path $env:RUNNER_TEMP 'close-normal-package-smoke'
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Push-Location $smoke
+          try {
+            & npm init --yes | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Smoke package init failed' }
+            $sdk=Join-Path $env:QA_OUT "packages/trycua-cua-driver-$env:VERSION.tgz"
+            $native=Join-Path $env:QA_OUT "packages/trycua-cua-driver-win32-x64-msvc-$env:VERSION.tgz"
+            & npm install --ignore-scripts --no-audit --no-fund --save-exact $sdk $native
+            if ($LASTEXITCODE -ne 0) { throw 'Normal local-tar SDK install failed' }
+            & node --input-type=module -e "import {CuaDriver} from '@trycua/cua-driver'; if(typeof CuaDriver!=='function')process.exit(1);console.log('normal versioned SDK ABI import passed; no driver/session/input');" | Set-Content -Encoding utf8 (Join-Path $env:QA_OUT 'normal-package-import.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Normal source SDK ABI import failed' }
+            Copy-Item package-lock.json (Join-Path $env:QA_OUT 'normal-package-install-lock.json')
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        if: always()
+        with:
+          name: close-lifecycle-msvc-${{ github.sha }}
+          path: ${{ runner.temp }}/close-lifecycle-artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

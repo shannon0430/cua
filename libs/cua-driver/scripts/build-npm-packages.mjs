@@ -35,6 +35,14 @@ const version = valueAfter("--version")
 const nativeRoot = resolve(valueAfter("--native-dir"))
 const outputRoot = resolve(valueAfter("--output-dir"))
 const allowPartial = process.argv.includes("--allow-partial")
+const missingPlatformVersion = process.argv.includes("--missing-platform-version")
+  ? valueAfter("--missing-platform-version") : version
+if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(missingPlatformVersion)) {
+  throw new Error(`invalid missing-platform version: ${missingPlatformVersion}`)
+}
+if (missingPlatformVersion !== version && !allowPartial) {
+  throw new Error("missing-platform version override requires --allow-partial")
+}
 if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)) {
   throw new Error(`invalid release version: ${version}`)
 }
@@ -49,6 +57,8 @@ const platforms = [
 ]
 const runtimeFile = "cua_driver_node_runtime.node"
 const runtimeNotice = "node-runtime-NOTICE.md"
+const licenseFile = "LICENSE.md"
+const licenseSource = resolve(driverRoot, "..", "..", licenseFile)
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
@@ -75,7 +85,10 @@ for (const platform of platforms) {
   optionalDependencies[name] = version
   const source = join(nativeRoot, platform.triple, platform.file)
   if (!existsSync(source)) {
-    if (allowPartial) continue
+    if (allowPartial) {
+      optionalDependencies[name] = missingPlatformVersion
+      continue
+    }
     throw new Error(`missing native SDK library ${source}`)
   }
   const runtimeSource = join(nativeRoot, platform.triple, runtimeFile)
@@ -88,6 +101,7 @@ for (const platform of platforms) {
   cpSync(source, join(destination, platform.file))
   cpSync(runtimeSource, join(destination, runtimeFile))
   cpSync(join(scriptDirectory, runtimeNotice), join(destination, runtimeNotice))
+  cpSync(licenseSource, join(destination, licenseFile))
   const manifest = {
     name,
     version,
@@ -96,7 +110,7 @@ for (const platform of platforms) {
     repository: { type: "git", url: "git+https://github.com/trycua/cua.git" },
     os: [platform.os],
     cpu: [platform.cpu],
-    files: [platform.file, runtimeFile, runtimeNotice],
+    files: [platform.file, runtimeFile, runtimeNotice, licenseFile],
     publishConfig: { access: "public" },
   }
   if (platform.libc) manifest.libc = [platform.libc]
@@ -123,8 +137,10 @@ for (const nativeFile of [
   if (existsSync(staleColocatedLibrary)) unlinkSync(staleColocatedLibrary)
 }
 cpSync(join(typescriptRoot, "README.md"), join(rootStage, "README.md"))
+cpSync(licenseSource, join(rootStage, licenseFile))
 writeJson(join(rootStage, "package.json"), {
   ...sourceManifest,
+  files: [...sourceManifest.files, licenseFile],
   scripts: undefined,
   devDependencies: undefined,
   optionalDependencies,

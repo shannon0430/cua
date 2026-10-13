@@ -26,7 +26,8 @@ pub use keyboard::{
 };
 pub use mouse::{
     has_chromium_descendant, is_chromium_target_window, post_click, post_click_screen,
-    send_click_synthesized, send_click_synthesized_active_mods, send_click_synthesized_mods,
+    send_click_synthesized, send_click_synthesized_active_mods,
+    send_click_synthesized_active_mods_with_outcome, send_click_synthesized_mods,
     send_wheel_synthesized,
 };
 
