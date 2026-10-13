@@ -50,19 +50,23 @@ jobs:
         working-directory: libs/cua-driver/rust
         run: |
           $ErrorActionPreference = 'Stop'
-          function Run-Cargo([string]$label,[string[]]$arguments) {
+          function Run-Cargo([string]$label,[string[]]$arguments,[int]$expected=0) {
             $ErrorActionPreference = 'Continue'
             & cargo +1.97.1 @arguments 2>&1 | Tee-Object -FilePath (Join-Path $env:QA_OUT "$label.log")
             $code=$LASTEXITCODE
             if ($code -ne 0) { throw "$label failed with exit $code" }
+            if ($expected -gt 0) {
+              $summary=[regex]::Match((Get-Content -Raw (Join-Path $env:QA_OUT "$label.log")), 'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+              if (-not $summary.Success -or [int]$summary.Groups[1].Value -ne $expected -or [int]$summary.Groups[2].Value -ne 0 -or [int]$summary.Groups[3].Value -ne 0) { throw "$label did not execute exactly $expected passing cases" }
+            }
           }
-          Run-Cargo 'lifecycle-regressions' @('test','--locked','-p','platform-windows','--lib','click_target_lifecycle_tests::','--','--test-threads=1')
-          Run-Cargo 'identity-delivery-regressions' @('test','--locked','-p','platform-windows','--lib','click_lifetime_delivery_tests::','--','--test-threads=1')
-          Run-Cargo 'outcome-projection-regressions' @('test','--locked','-p','platform-windows','--lib','foreground_click_outcome_projection_tests::','--','--test-threads=1')
+          Run-Cargo 'lifecycle-regressions' @('test','--locked','-p','platform-windows','--lib','click_target_lifecycle_tests::','--','--test-threads=1') 9
+          Run-Cargo 'identity-delivery-regressions' @('test','--locked','-p','platform-windows','--lib','click_lifetime_delivery_tests::','--','--test-threads=1') 3
+          Run-Cargo 'outcome-projection-regressions' @('test','--locked','-p','platform-windows','--lib','foreground_click_outcome_projection_tests::','--','--test-threads=1') 2
           $session=(Get-Process -Id $PID).SessionId
           if ($session -eq 0) { throw 'Owned interactive fixture cannot run in Session0' }
-          Run-Cargo 'owned-destroyed-click' @('test','--locked','-p','platform-windows','--lib','click_owned_destroyed_fixture_tests::','--','--ignored','--test-threads=1')
-          Run-Cargo 'sdk-abi' @('test','--locked','-p','cua-driver-sdk','--lib','abi::tests::','--','--test-threads=1')
+          Run-Cargo 'owned-destroyed-click' @('test','--locked','-p','platform-windows','--lib','click_owned_destroyed_fixture_tests::','--','--ignored','--test-threads=1') 1
+          Run-Cargo 'sdk-abi' @('test','--locked','-p','cua-driver-sdk','--lib','abi::tests::','--','--test-threads=1') 6
           Run-Cargo 'release-build' @('build','--locked','-p','cua-driver-sdk','--release','--target','x86_64-pc-windows-msvc')
       - name: Canonical versioned SDK and Windows package assembly
         run: |

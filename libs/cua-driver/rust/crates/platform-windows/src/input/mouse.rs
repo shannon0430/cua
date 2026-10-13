@@ -4,7 +4,7 @@
 //! (via ChildWindowFromPointEx), so the message never reaches the top-level
 //! chrome that would call SetForegroundWindow in response to WM_LBUTTONDOWN.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::thread::sleep;
 use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -1458,7 +1458,7 @@ mod click_owned_destroyed_fixture_tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
         GetMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, UnregisterClassW, MSG,
-        WINDOW_EX_STYLE, WM_LBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        WINDOW_EX_STYLE, WM_CLOSE, WM_LBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
     unsafe extern "system" fn fixture_proc(
         hwnd: HWND,
@@ -1466,7 +1466,7 @@ mod click_owned_destroyed_fixture_tests {
         wp: WPARAM,
         lp: LPARAM,
     ) -> LRESULT {
-        if message == WM_LBUTTONUP {
+        if message == WM_LBUTTONUP || message == WM_CLOSE {
             let _ = DestroyWindow(hwnd);
             PostQuitMessage(0);
             return LRESULT(0);
