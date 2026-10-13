@@ -293,6 +293,22 @@ impl Content {
     }
 }
 
+/// Finite post-dispatch lifecycle evidence. This does not confirm an
+/// application command, edit commit, save, or causal Close effect.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub enum NativeTargetTransition {
+    #[serde(rename = "target_retained")]
+    Retained,
+    #[serde(rename = "target_destroyed")]
+    Destroyed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeActionLifecycle {
+    pub target_transition: NativeTargetTransition,
+}
+
 /// The value placed in `result` for a `tools/call` response.
 #[derive(Debug, Serialize, Default)]
 pub struct ToolResult {
@@ -306,6 +322,13 @@ pub struct ToolResult {
     /// the MCP result envelope or its legacy structured payload.
     #[serde(skip)]
     pub action_record: Option<crate::action_record::ActionExecutionRecord>,
+    /// Optional envelope metadata deliberately outside the closed ActionResult.
+    /// SDK rawJson preserves it without changing generated UniFFI bindings.
+    #[serde(
+        rename = "nativeActionLifecycle",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub native_action_lifecycle: Option<NativeActionLifecycle>,
 }
 
 impl ToolResult {
@@ -326,6 +349,13 @@ impl ToolResult {
 
     pub fn with_structured(mut self, v: Value) -> Self {
         self.structured_content = Some(v);
+        self
+    }
+
+    pub fn with_native_target_transition(mut self, transition: NativeTargetTransition) -> Self {
+        self.native_action_lifecycle = Some(NativeActionLifecycle {
+            target_transition: transition,
+        });
         self
     }
 

@@ -1637,6 +1637,7 @@ impl Tool for GetWindowStateTool {
                     is_error: None,
                     structured_content: Some(structured),
                     action_record: None,
+                    native_action_lifecycle: None,
                 }
             }
             Err(e) => ToolResult::error(format!("Error: {e}")),
@@ -3048,6 +3049,14 @@ fn foreground_click_result(
         EvidenceKind, RequestedDelivery,
     };
     let transition = outcome.target_transition.as_str();
+    let native_transition = match outcome.target_transition {
+        crate::input::mouse::ClickTargetTransition::Retained => {
+            cua_driver_core::protocol::NativeTargetTransition::Retained
+        }
+        crate::input::mouse::ClickTargetTransition::Destroyed => {
+            cua_driver_core::protocol::NativeTargetTransition::Destroyed
+        }
+    };
     let record = ActionExecutionRecord::builder(
         ActionEffect::Unverifiable, ActionTransport::WindowsSendInput, RequestedDelivery::Foreground,
     ).actual_delivery(ActualDelivery::Foreground)
@@ -3058,7 +3067,8 @@ fn foreground_click_result(
         .detail("target lifecycle is observed after dispatch; application command effect and persistence are not verified")
         .build().expect("foreground click evidence is valid");
     ToolResult::text(message)
-        .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable", "target_transition": transition }))
+        .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" }))
+        .with_native_target_transition(native_transition)
         .with_action_record(record)
 }
 
@@ -7924,6 +7934,7 @@ impl Tool for GetDesktopStateTool {
             is_error: None,
             structured_content: Some(structured),
             action_record: None,
+            native_action_lifecycle: None,
         }
     }
 }
@@ -8876,6 +8887,7 @@ impl Tool for ZoomTool {
                         "mime_type": "image/jpeg"
                     })),
                     action_record: None,
+                    native_action_lifecycle: None,
                 }
             }
             Ok(Err(e)) => ToolResult::error(format!("Zoom failed: {e}")),
@@ -10790,9 +10802,10 @@ mod foreground_click_outcome_projection_tests {
             result.action_record.as_ref().unwrap().delivered_count,
             Some(3)
         );
+        let lifecycle = serde_json::to_value(result.native_action_lifecycle).unwrap();
+        assert_eq!(lifecycle["targetTransition"], "target_destroyed");
         let projection = result.structured_content.unwrap();
         assert_eq!(projection["effect"], "unverifiable");
-        assert_eq!(projection["target_transition"], "target_destroyed");
         assert_eq!(projection["verified"], false);
     }
     #[test]
@@ -10805,8 +10818,9 @@ mod foreground_click_outcome_projection_tests {
                 target_transition: crate::input::mouse::ClickTargetTransition::Retained,
             },
         );
+        let lifecycle = serde_json::to_value(result.native_action_lifecycle).unwrap();
+        assert_eq!(lifecycle["targetTransition"], "target_retained");
         let projection = result.structured_content.unwrap();
         assert_eq!(projection["effect"], "unverifiable");
-        assert_eq!(projection["target_transition"], "target_retained");
     }
 }

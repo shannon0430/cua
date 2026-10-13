@@ -117,6 +117,7 @@ impl Tool for ZoomTool {
                         "mime_type": "image/jpeg"
                     })),
                     action_record: None,
+                    native_action_lifecycle: None,
                 }
             }
             Ok(Err(e)) => ToolResult::error(format!("Zoom failed: {e}")),

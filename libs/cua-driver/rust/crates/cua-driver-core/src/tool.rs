@@ -5683,3 +5683,57 @@ mod capability_tests {
             }));
     }
 }
+
+#[cfg(test)]
+mod native_action_lifecycle_wire_tests {
+    use super::*;
+    use crate::action_record::{
+        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        EvidenceKind, RequestedDelivery,
+    };
+    fn result() -> ToolResult {
+        ToolResult::text("sent")
+            .with_native_target_transition(crate::protocol::NativeTargetTransition::Destroyed)
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::WindowsSendInput,
+                    RequestedDelivery::Foreground,
+                )
+                .actual_delivery(ActualDelivery::Foreground)
+                .delivered_count(3)
+                .evidence(ActionEvidence {
+                    kind: EvidenceKind::WindowChange,
+                    detail: "target_destroyed".into(),
+                })
+                .build()
+                .unwrap(),
+            )
+    }
+    #[test]
+    fn finite_lifecycle_survives_closed_action_result_publication() {
+        let mut result = result();
+        publish_action_result(&mut result).unwrap();
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(
+            wire["nativeActionLifecycle"],
+            serde_json::json!({"targetTransition":"target_destroyed"})
+        );
+        assert_eq!(wire["structuredContent"]["effect"], "unverifiable");
+        assert_eq!(wire["structuredContent"]["delivery"]["delivered_count"], 3);
+        let typed = serde_json::from_value::<cua_driver_contract::ActionResult>(
+            wire["structuredContent"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            typed.effect,
+            cua_driver_contract::ActionEffect::Unverifiable
+        );
+        assert!(wire.get("action_record").is_none());
+    }
+    #[test]
+    fn unchanged_result_has_no_lifecycle_metadata() {
+        let wire = serde_json::to_value(ToolResult::text("unchanged")).unwrap();
+        assert!(wire.get("nativeActionLifecycle").is_none());
+    }
+}

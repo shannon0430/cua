@@ -65,9 +65,17 @@ function writeJson(path, value) {
 }
 
 function pack(directory) {
+  // Windows cannot CreateProcess npm.cmd directly. Invoke the standard npm
+  // JavaScript CLI bundled beside the pinned official Node executable, with
+  // an argument vector and no shell/quoting fallback.
+  const args = ["pack", directory, "--pack-destination", outputRoot, "--json"]
+  const windowsNpmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+  if (process.platform === "win32" && !existsSync(windowsNpmCli)) {
+    throw new Error(`standard npm CLI missing beside Node: ${windowsNpmCli}`)
+  }
   const result = spawnSync(
-    "npm",
-    ["pack", directory, "--pack-destination", outputRoot, "--json"],
+    process.platform === "win32" ? process.execPath : "npm",
+    process.platform === "win32" ? [windowsNpmCli, ...args] : args,
     { cwd: typescriptRoot, encoding: "utf8" },
   )
   if (result.status !== 0) {

@@ -697,6 +697,7 @@ impl Tool for GetWindowStateTool {
             is_error: None,
             structured_content: Some(structured),
             action_record: None,
+            native_action_lifecycle: None,
         }
     }
 }
